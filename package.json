@@ -22,11 +22,10 @@
     "README.md",
     "LICENSE",
     "src",
-    "scripts/build-from-source.js",
+    "scripts/stress-windows.js",
     "binding.gyp"
   ],
   "scripts": {
-    "prebuild": "prebuildify --napi --strip --tag-libc",
     "format": "prettier --write \"./**/*.{js,mjs,json,md,ts,flow}\"",
     "build": "node-gyp rebuild",
     "install": "node-gyp rebuild",
@@ -59,7 +58,6 @@
     "lint-staged": "^11.1.2",
     "mocha": "^9.1.1",
     "napi-wasm": "^1.1.0",
-    "prebuildify": "^6.0.1",
     "prettier": "^2.3.2"
   },
   "binary": {
