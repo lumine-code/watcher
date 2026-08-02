@@ -52,28 +52,60 @@ void BruteForceBackend::readTree(WatcherRef watcher, std::shared_ptr<DirTree> tr
   }
 }
 
+WindowsBackend::WindowsBackend()
+  : mRunFlag(std::make_shared<std::atomic<bool>>(true)),
+    mArmedCount(std::make_shared<std::atomic<int>>(0)) {}
+
 void WindowsBackend::start() {
-  mRunning = true;
+  // Local copies: when the last watcher errors out, this backend can be
+  // destroyed from this very thread (Backend::handleWatcherError →
+  // removeShared), so the loop must not read members after that.
+  auto runFlag = mRunFlag;
+  auto armedCount = mArmedCount;
+
   notifyStarted();
 
-  while (mRunning) {
+  while (runFlag->load()) {
     SleepEx(INFINITE, true);
+  }
+
+  // Drain cancelled I/O completions so every armed Subscription is released
+  // before the destructor joins this thread. Bounded: a completion that never
+  // arrives only leaks that subscription — its buffers stay valid for the
+  // kernel, which is safe; freeing them early is what is not.
+  int spins = 0;
+  while (armedCount->load() > 0 && spins++ < 400) {
+    SleepEx(5, true);
   }
 }
 
 WindowsBackend::~WindowsBackend() {
   // Mark as stopped, and queue a noop function in the thread to break the loop
-  mRunning = false;
+  mRunFlag->store(false);
   QueueUserAPC([](__in ULONG_PTR) {}, mThread.native_handle(), (ULONG_PTR)this);
 }
 
+// Lifecycle contract: everything below (run/stop/poll/processEvents and the
+// I/O completion routine) executes on the backend thread only — it is reached
+// exclusively through APCs queued to it. The kernel holds raw pointers into
+// this object (mOverlapped, mWriteBuffer) while a ReadDirectoryChangesW is
+// pending, and the completion routine receives a raw `this` via
+// `overlapped->hEvent`, so the object must stay alive from arm to completion.
+// `mSelfRef` holds it across exactly that window; only the completion routine
+// releases it. Destruction therefore always happens on the backend thread
+// with no I/O in flight. Freeing on the unsubscribing thread instead (the old
+// behavior) let a pending completion run over freed memory — and, because
+// CancelIo is asynchronous, let the kernel write notify data into the freed
+// buffer.
 class Subscription: public WatcherState {
 public:
   Subscription(WindowsBackend *backend, WatcherRef watcher, std::shared_ptr<DirTree> tree) {
     mRunning = true;
+    mIoPending = false;
     mBackend = backend;
     mWatcher = watcher;
     mTree = tree;
+    mArmedCount = backend->armedCount();
     ZeroMemory(&mOverlapped, sizeof(OVERLAPPED));
     mOverlapped.hEvent = this;
     mReadBuffer.resize(DEFAULT_BUF_SIZE);
@@ -110,26 +142,33 @@ public:
   }
 
   virtual ~Subscription() {
-    stop();
+    if (mDirectoryHandle != INVALID_HANDLE_VALUE) {
+      CloseHandle(mDirectoryHandle);
+    }
   }
 
-  void run() {
+  void run(std::shared_ptr<Subscription>& self) {
     try {
-      poll();
+      poll(self);
     } catch (WatcherError &err) {
       mBackend->handleWatcherError(err);
     }
   }
 
   void stop() {
-    if (mRunning) {
-      mRunning = false;
+    if (!mRunning) {
+      return;
+    }
+    mRunning = false;
+    if (mIoPending) {
+      // The ERROR_OPERATION_ABORTED completion releases mSelfRef.
       CancelIo(mDirectoryHandle);
-      CloseHandle(mDirectoryHandle);
+    } else {
+      mSelfRef.reset();
     }
   }
 
-  void poll() {
+  void poll(std::shared_ptr<Subscription>& self) {
     if (!mRunning) {
       return;
     }
@@ -145,11 +184,20 @@ public:
       NULL,
       &mOverlapped,
       [](DWORD errorCode, DWORD numBytes, LPOVERLAPPED overlapped) {
-        auto subscription = reinterpret_cast<Subscription *>(overlapped->hEvent);
+        auto sub = reinterpret_cast<Subscription *>(overlapped->hEvent);
+        // Take over the arm-window reference. If the subscription does not
+        // re-arm below, this scope's copy is the last one and the object is
+        // destroyed here, on the backend thread, with no I/O pending.
+        std::shared_ptr<Subscription> self = std::move(sub->mSelfRef);
+        sub->mIoPending = false;
+        sub->mArmedCount->fetch_sub(1);
+        if (errorCode == ERROR_OPERATION_ABORTED || !sub->mRunning) {
+          return;
+        }
         try {
-          subscription->processEvents(errorCode);
+          sub->processEvents(errorCode, self);
         } catch (WatcherError &err) {
-          subscription->mBackend->handleWatcherError(err);
+          sub->mBackend->handleWatcherError(err);
         }
       }
     );
@@ -157,13 +205,13 @@ public:
     if (!success) {
       throw WatcherError("Failed to read changes", mWatcher);
     }
+
+    mIoPending = true;
+    mArmedCount->fetch_add(1);
+    mSelfRef = self;
   }
 
-  void processEvents(DWORD errorCode) {
-    if (!mRunning) {
-      return;
-    }
-
+  void processEvents(DWORD errorCode, std::shared_ptr<Subscription>& self) {
     switch (errorCode) {
       case ERROR_OPERATION_ABORTED:
         return;
@@ -171,7 +219,7 @@ public:
         // resize buffers to network size (64kb), and try again
         mReadBuffer.resize(NETWORK_BUF_SIZE);
         mWriteBuffer.resize(NETWORK_BUF_SIZE);
-        poll();
+        poll(self);
         return;
       case ERROR_NOTIFY_ENUM_DIR:
         throw WatcherError("Buffer overflow. Some events may have been lost.", mWatcher);
@@ -196,7 +244,7 @@ public:
 
     // Swap read and write buffers, and poll again
     std::swap(mWriteBuffer, mReadBuffer);
-    poll();
+    poll(self);
 
     // Read change events
     BYTE *base = mReadBuffer.data();
@@ -253,6 +301,9 @@ private:
   std::shared_ptr<Watcher> mWatcher;
   std::shared_ptr<DirTree> mTree;
   bool mRunning;
+  bool mIoPending;
+  std::shared_ptr<std::atomic<int>> mArmedCount;
+  std::shared_ptr<Subscription> mSelfRef;
   HANDLE mDirectoryHandle;
   std::vector<BYTE> mReadBuffer;
   std::vector<BYTE> mWriteBuffer;
@@ -265,18 +316,46 @@ void WindowsBackend::subscribe(WatcherRef watcher) {
   auto sub = std::make_shared<Subscription>(this, watcher, getTree(watcher, false));
   watcher->state = sub;
 
-  // Queue polling for this subscription in the correct thread.
+  // Hand the backend thread its own reference. The subscription can be
+  // unsubscribed (dropping the registry reference above) before the APC runs,
+  // so the APC owns a boxed reference rather than a raw pointer.
+  auto boxed = new std::shared_ptr<Subscription>(sub);
   bool success = QueueUserAPC([](__in ULONG_PTR ptr) {
-    Subscription *sub = (Subscription *)ptr;
-    sub->run();
-  }, mThread.native_handle(), (ULONG_PTR)sub.get());
+    auto box = reinterpret_cast<std::shared_ptr<Subscription> *>(ptr);
+    std::shared_ptr<Subscription> self = std::move(*box);
+    delete box;
+    self->run(self);
+  }, mThread.native_handle(), (ULONG_PTR)boxed);
 
   if (!success) {
+    delete boxed;
     throw std::runtime_error("Unable to queue APC");
   }
 }
 
 // This function is called by Backend::unwatch which takes a lock on mMutex
 void WindowsBackend::unsubscribe(WatcherRef watcher) {
+  auto sub = std::static_pointer_cast<Subscription>(watcher->state);
   watcher->state = nullptr;
+  if (!sub) {
+    return;
+  }
+
+  // Teardown must happen on the backend thread — see the lifecycle contract
+  // above the Subscription class.
+  auto boxed = new std::shared_ptr<Subscription>(std::move(sub));
+  bool success = QueueUserAPC([](__in ULONG_PTR ptr) {
+    auto box = reinterpret_cast<std::shared_ptr<Subscription> *>(ptr);
+    std::shared_ptr<Subscription> self = std::move(*box);
+    delete box;
+    self->stop();
+  }, mThread.native_handle(), (ULONG_PTR)boxed);
+
+  if (!success) {
+    // The thread is gone (backend teardown). If the subscription still has
+    // I/O in flight, its self-reference keeps the kernel-visible memory
+    // alive; dropping our reference here at worst leaks it, never frees it
+    // early.
+    delete boxed;
+  }
 }
