@@ -1,6 +1,8 @@
-# @parcel/watcher
+# watcher
 
-A native C++ Node module for querying and subscribing to filesystem events. Used by [Parcel 2](https://github.com/parcel-bundler/parcel).
+Watches directories and queries filesystem events from native code.
+
+A fork of [parcel-bundler/watcher](https://github.com/parcel-bundler/watcher) maintained for the Lumine editor. It differs from upstream in two ways: the Windows backend confines subscription teardown to its I/O thread, fixing a use-after-free where a pending `ReadDirectoryChangesW` completion (or the kernel writing into the notify buffer) raced `unsubscribe()` and crashed the process; and it always builds from source at install instead of downloading platform prebuilts. Everything else deliberately tracks upstream so their changes merge cleanly.
 
 ## Features
 
