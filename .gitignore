@@ -7,5 +7,6 @@ token.txt
 .idea
 stress-test
 crash.log
+mocha-windows.log
 test/snapshot.txt
 npm
