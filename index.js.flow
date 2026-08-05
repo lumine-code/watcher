@@ -3,11 +3,7 @@ declare type FilePath = string;
 declare type GlobPattern = string;
 
 export type BackendType =
-  | 'fs-events'
-  | 'watchman'
-  | 'inotify'
-  | 'windows'
-  | 'brute-force';
+  'fs-events' | 'watchman' | 'inotify' | 'windows' | 'brute-force';
 export type EventType = 'create' | 'update' | 'delete';
 export interface Options {
   ignore?: Array<FilePath | GlobPattern | RegExp>;

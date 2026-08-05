@@ -3,11 +3,7 @@ declare type GlobPattern = string;
 
 declare namespace ParcelWatcher {
   export type BackendType =
-    | 'fs-events'
-    | 'watchman'
-    | 'inotify'
-    | 'windows'
-    | 'brute-force';
+    'fs-events' | 'watchman' | 'inotify' | 'windows' | 'brute-force';
   export type EventType = 'create' | 'update' | 'delete';
   export interface Options {
     ignore?: (FilePath | GlobPattern | RegExp)[];

@@ -98,18 +98,18 @@ const wasm_env = {
       let type = entry.isFIFO()
         ? 1
         : entry.isCharacterDevice()
-        ? 2
-        : entry.isDirectory()
-        ? 4
-        : entry.isBlockDevice()
-        ? 6
-        : entry.isFile()
-        ? 8
-        : entry.isSymbolicLink()
-        ? 10
-        : entry.isSocket()
-        ? 12
-        : 0;
+          ? 2
+          : entry.isDirectory()
+            ? 4
+            : entry.isBlockDevice()
+              ? 6
+              : entry.isFile()
+                ? 8
+                : entry.isSymbolicLink()
+                  ? 10
+                  : entry.isSocket()
+                    ? 12
+                    : 0;
       let len = align(utf8Length(entry.name) + 20, 8);
       if (dirp - start + len > count) {
         break;
