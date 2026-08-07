@@ -1,0 +1,52 @@
+name: CodeQL
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "0 0 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Analyze ${{ matrix.language }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        # binding.gyp selects a different set of sources per platform, so the
+        # C++ is analysed on each one. The JavaScript is identical everywhere
+        # and is analysed once.
+        include:
+          - {language: javascript-typescript, os: ubuntu-latest}
+          - {language: cpp, os: ubuntu-latest}
+          - {language: cpp, os: macos-latest}
+          - {language: cpp, os: windows-latest}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+      - run: npm ci
+      # cpp analysis only reports on code it watches being compiled, and the
+      # step between init and analyze is the one place that happens. Build
+      # explicitly rather than trusting npm ci, which skips the rebuild
+      # whenever a usable binding is already present.
+      - if: matrix.language == 'cpp'
+        run: npm run build
+      - uses: github/codeql-action/analyze@v4
+        with:
+          category: /language:${{ matrix.language }}/os:${{ matrix.os }}
