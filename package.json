@@ -37,11 +37,11 @@
   "dependencies": {
     "detect-libc": "^2.1.2",
     "is-glob": "^4.0.3",
-    "node-addon-api": "^8.9.1",
+    "node-addon-api": "^8.9.2",
     "picomatch": "^4.0.5"
   },
   "devDependencies": {
-    "esbuild": "^0.28.1",
+    "esbuild": "^0.28.2",
     "fs-extra": "^11.4.0",
     "mocha": "^11.8.0",
     "napi-wasm": "^1.1.3",
