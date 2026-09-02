@@ -2,6 +2,7 @@
 #include <fstream>
 #include <stdlib.h>
 #include <algorithm>
+#include <vector>
 #include "../DirTree.hh"
 #include "../Event.hh"
 #include "./BSER.hh"
@@ -10,11 +11,49 @@
 #ifdef _WIN32
 #include "../windows/win_utils.hh"
 #define S_ISDIR(mode) ((mode & _S_IFDIR) == _S_IFDIR)
-#define popen _popen
-#define pclose _pclose
 #else
 #include <sys/stat.h>
 #define normalizePath(dir) dir
+#endif
+
+#ifdef _WIN32
+class WinHandle {
+public:
+  explicit WinHandle(HANDLE value = INVALID_HANDLE_VALUE) : mValue(value) {}
+  ~WinHandle() { reset(); }
+
+  WinHandle(const WinHandle&) = delete;
+  WinHandle& operator=(const WinHandle&) = delete;
+
+  HANDLE get() const { return mValue; }
+
+  void reset(HANDLE value = INVALID_HANDLE_VALUE) {
+    if (mValue != INVALID_HANDLE_VALUE && mValue != NULL) {
+      CloseHandle(mValue);
+    }
+    mValue = value;
+  }
+
+private:
+  HANDLE mValue;
+};
+
+std::wstring findWatchmanExecutable() {
+  DWORD size = SearchPathW(NULL, L"watchman.exe", NULL, 0, NULL, NULL);
+  if (size == 0) {
+    throw std::runtime_error("Failed to find watchman.exe");
+  }
+
+  std::wstring executable(size, L'\0');
+  DWORD written = SearchPathW(NULL, L"watchman.exe", NULL, size, executable.data(), NULL);
+  if (written == 0 || written >= size) {
+    throw std::runtime_error("Failed to resolve watchman.exe");
+  }
+  executable.resize(written);
+  return executable;
+}
+
+BSER getSockNameWithoutConsole();
 #endif
 
 template<typename T>
@@ -40,6 +79,88 @@ BSER readBSER(T &&do_read) {
   return BSER(oss);
 }
 
+#ifdef _WIN32
+BSER getSockNameWithoutConsole() {
+  SECURITY_ATTRIBUTES attributes{};
+  attributes.nLength = sizeof(attributes);
+  attributes.bInheritHandle = TRUE;
+
+  HANDLE stdoutReadRaw = INVALID_HANDLE_VALUE;
+  HANDLE stdoutWriteRaw = INVALID_HANDLE_VALUE;
+  if (!CreatePipe(&stdoutReadRaw, &stdoutWriteRaw, &attributes, 0)) {
+    throw std::runtime_error("Failed to create watchman output pipe");
+  }
+  WinHandle stdoutRead(stdoutReadRaw);
+  WinHandle stdoutWrite(stdoutWriteRaw);
+
+  if (!SetHandleInformation(stdoutRead.get(), HANDLE_FLAG_INHERIT, 0)) {
+    throw std::runtime_error("Failed to isolate watchman output pipe");
+  }
+
+  WinHandle nullDevice(CreateFileW(
+    L"NUL",
+    GENERIC_READ | GENERIC_WRITE,
+    FILE_SHARE_READ | FILE_SHARE_WRITE,
+    &attributes,
+    OPEN_EXISTING,
+    FILE_ATTRIBUTE_NORMAL,
+    NULL
+  ));
+  if (nullDevice.get() == INVALID_HANDLE_VALUE) {
+    throw std::runtime_error("Failed to open NUL for watchman");
+  }
+
+  std::wstring executable = findWatchmanExecutable();
+  std::wstring command = L"\"" + executable + L"\" --output-encoding=bser get-sockname";
+  std::vector<WCHAR> mutableCommand(command.begin(), command.end());
+  mutableCommand.push_back(L'\0');
+
+  STARTUPINFOW startup{};
+  startup.cb = sizeof(startup);
+  startup.dwFlags = STARTF_USESTDHANDLES;
+  startup.hStdInput = nullDevice.get();
+  startup.hStdOutput = stdoutWrite.get();
+  startup.hStdError = nullDevice.get();
+
+  PROCESS_INFORMATION processInfo{};
+  if (!CreateProcessW(
+        executable.c_str(),
+        mutableCommand.data(),
+        NULL,
+        NULL,
+        TRUE,
+        CREATE_NO_WINDOW,
+        NULL,
+        NULL,
+        &startup,
+        &processInfo
+      )) {
+    throw std::runtime_error("Failed to execute watchman");
+  }
+  WinHandle process(processInfo.hProcess);
+  WinHandle thread(processInfo.hThread);
+  stdoutWrite.reset();
+
+  BSER result = readBSER([&stdoutRead] (char *buf, size_t len) {
+    DWORD bytesRead = 0;
+    if (!ReadFile(stdoutRead.get(), buf, static_cast<DWORD>(len), &bytesRead, NULL)) {
+      DWORD error = GetLastError();
+      if (error != ERROR_BROKEN_PIPE) {
+        throw std::runtime_error("Failed to read watchman output");
+      }
+    }
+    return static_cast<size_t>(bytesRead);
+  });
+
+  DWORD waitResult = WaitForSingleObject(process.get(), INFINITE);
+  DWORD exitCode = 0;
+  if (waitResult != WAIT_OBJECT_0 || !GetExitCodeProcess(process.get(), &exitCode) || exitCode != 0) {
+    throw std::runtime_error("watchman get-sockname failed");
+  }
+  return result;
+}
+#endif
+
 std::string getSockPath() {
   auto var = getenv("WATCHMAN_SOCK");
   if (var && *var) {
@@ -47,10 +168,9 @@ std::string getSockPath() {
   }
 
 #ifdef _WIN32
-  FILE *fp = popen("watchman --output-encoding=bser get-sockname", "r");
+  BSER b = getSockNameWithoutConsole();
 #else
   FILE *fp = popen("watchman --output-encoding=bser get-sockname 2>/dev/null", "r");
-#endif
   if (fp == NULL || errno == ECHILD) {
     throw std::runtime_error("Failed to execute watchman");
   }
@@ -60,6 +180,7 @@ std::string getSockPath() {
   });
 
   pclose(fp);
+#endif
 
   auto objValue = b.objectValue();
   auto foundSockname = objValue.find("sockname");

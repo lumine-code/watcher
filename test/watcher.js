@@ -1,7 +1,7 @@
 const assert = require('assert');
 const fs = require('fs-extra');
 const path = require('path');
-const {execSync} = require('child_process');
+const {execFileSync, execSync, spawnSync} = require('child_process');
 const {Worker} = require('worker_threads');
 
 let watcher, watcherNative;
@@ -978,6 +978,87 @@ describe('watcher', () => {
 
         let err = await p;
         assert(err, 'No error was emitted');
+      });
+    });
+  }
+
+  if (process.platform === 'win32') {
+    describe('default backend watchman probe', () => {
+      let probeDir;
+
+      before(() => {
+        probeDir = path.join(
+          fs.realpathSync(require('os').tmpdir()),
+          Math.random().toString(31).slice(2),
+        );
+        fs.mkdirpSync(probeDir);
+      });
+
+      after(() => fs.removeSync(probeDir));
+
+      function runChild(env, backend) {
+        const result = spawnSync(
+          process.execPath,
+          [
+            '-e',
+            `
+              const watcher = require(process.env.WATCHER_TEST_MODULE);
+              async function run() {
+                const options = process.env.WATCHER_TEST_BACKEND
+                  ? {backend: process.env.WATCHER_TEST_BACKEND}
+                  : {};
+                const subscription = await watcher.subscribe(
+                  process.env.WATCHER_TEST_DIR,
+                  () => {},
+                  options,
+                );
+                await subscription.unsubscribe();
+              }
+              run().catch((error) => {
+                console.error(error);
+                process.exitCode = 1;
+              });
+            `,
+          ],
+          {
+            encoding: 'utf8',
+            windowsHide: true,
+            env: {
+              ...env,
+              WATCHER_TEST_MODULE: require.resolve('../'),
+              WATCHER_TEST_DIR: probeDir,
+              WATCHER_TEST_BACKEND: backend || '',
+            },
+          },
+        );
+        assert.equal(result.status, 0, result.stderr || result.stdout);
+      }
+
+      it('falls back to the native backend when watchman is absent', () => {
+        const env = {...process.env, PATH: ''};
+        delete env.WATCHMAN_SOCK;
+        runChild(env);
+      });
+
+      it('uses WATCHMAN_SOCK without resolving an executable', () => {
+        const response = JSON.parse(
+          execFileSync('watchman', ['--output-encoding=json', 'get-sockname'], {
+            encoding: 'utf8',
+            windowsHide: true,
+          }),
+        );
+        const env = {
+          ...process.env,
+          PATH: '',
+          WATCHMAN_SOCK: response.sockname,
+        };
+        runChild(env, 'watchman');
+      });
+
+      it('probes an installed watchman through the default backend', () => {
+        const env = {...process.env};
+        delete env.WATCHMAN_SOCK;
+        runChild(env);
       });
     });
   }
