@@ -1,7 +1,8 @@
 #include <CoreServices/CoreServices.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <unordered_set>
+#include <sys/stat.h>
+#include <unordered_map>
 #include "engine.hh"
 #include <set>
 
@@ -11,7 +12,7 @@ class MacOS : public Platform {
     MacOS* owner;
     Source source;
     fs::path canonical;
-    std::unordered_set<std::string> seen;
+    std::unordered_map<std::string, struct stat> seen;
     FSEventStreamRef stream = nullptr;
   };
   CFRunLoopRef loop;
@@ -118,14 +119,27 @@ private:
         action = !exists ? "deleted" : sub.seen.count(lexical) ? "updated" : "created";
       } else if (created) action = sub.seen.count(lexical) ? "updated" : "created";
       else if (removed) action = "deleted";
+      struct stat current{};
+      bool inspected = lstat(path.c_str(), &current) == 0;
+      bool contentChanged = flags[i] & kFSEventStreamEventFlagItemModified;
+      auto previous = sub.seen.find(lexical);
+      if (contentChanged && inspected && previous != sub.seen.end()) {
+        const auto& old = previous->second;
+        bool sameContentStamp = current.st_dev == old.st_dev && current.st_ino == old.st_ino && current.st_size == old.st_size && current.st_mtimespec.tv_sec == old.st_mtimespec.tv_sec && current.st_mtimespec.tv_nsec == old.st_mtimespec.tv_nsec;
+        bool permissionsChanged = current.st_mode != old.st_mode || current.st_uid != old.st_uid || current.st_gid != old.st_gid;
+        // ItemModified, like ItemCreated, may remain set on a later chmod.
+        // A metadata-only transition does not force a content reread. Writes
+        // restoring size/mtime still force rereads when permissions are stable.
+        if (sameContentStamp && permissionsChanged) contentChanged = false;
+      }
       // FSEvents can retain ItemCreated on a later write notification. Keep
-      // only the live names needed to distinguish those subsequent updates.
+      // only live entry metadata needed to disambiguate subsequent activity.
       if (action == "deleted") {
         for (auto it = sub.seen.begin(); it != sub.seen.end();) {
-          if (within(*it, lexical)) it = sub.seen.erase(it); else ++it;
+          if (within(it->first, lexical)) it = sub.seen.erase(it); else ++it;
         }
-      } else sub.seen.insert(lexical);
-      events.push_back({action, lexical, (flags[i] & kFSEventStreamEventFlagItemModified) != 0});
+      } else if (inspected) sub.seen.insert_or_assign(lexical, current);
+      events.push_back({action, lexical, contentChanged});
     }
     engine.changes(sub.source.id, std::move(events));
   }
