@@ -105,6 +105,7 @@ public:
   void remove(Id id) override {
     auto found = sources.find(id);
     if (found != sources.end()) {
+      bool wasGuard = found->second->source.guard;
       // Source storage outlives its stream. Stop, unschedule and invalidate on
       // the runloop owner before releasing the raw callback context.
       auto stream = found->second->stream;
@@ -118,6 +119,7 @@ public:
       // The CF descriptor is one-shot. Retire its notification state along
       // with the last vnode registration before this queue is reused.
       if (guardFds.empty()) clearGuardQueue();
+      else if (wasGuard) rearmGuardQueue();
     }
     pendingClose.erase(id);
     engine.closed(id);
@@ -150,6 +152,13 @@ public:
     CFRunLoopWakeUp(loop);
   }
 private:
+  void rearmGuardQueue() {
+    // Deleting a queued vnode may clear readability before the one-shot CF
+    // callback arrives. Refresh that registration after topology changes.
+    CFFileDescriptorDisableCallBacks(guardDescriptor, kCFFileDescriptorReadCallBack);
+    CFFileDescriptorEnableCallBacks(guardDescriptor, kCFFileDescriptorReadCallBack);
+  }
+
   void clearGuardQueue() {
     if (guardRunSource) {
       CFRunLoopRemoveSource(loop, guardRunSource, kCFRunLoopDefaultMode);
@@ -243,6 +252,7 @@ private:
       node->owners[sub.source.id] = *it == sub.canonical;
       configureGuardNode(node);
     }
+    rearmGuardQueue();
   }
 
   void releaseGuardNode(const std::shared_ptr<GuardNode>& node, Id id) {
