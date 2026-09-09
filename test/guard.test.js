@@ -169,3 +169,73 @@ test('guards reject recursive or non-boolean guard options', async (t) => {
     TypeError,
   );
 });
+
+test(
+  'persistent unrelated sources survive repeated guard and content handoffs',
+  {timeout: 30000},
+  async (t) => {
+    const {root, engine} = fixture(t);
+    const profile = path.join(root, 'profile');
+    fs.mkdirSync(profile);
+    const persistent = engine.watchDirectory(
+      profile,
+      {recursive: true},
+      () => {},
+    );
+    const persistentGuard = observe(engine, profile);
+    await Promise.all([persistent.ready, persistentGuard.handle.ready]);
+    const parent = path.join(root, 'working');
+    fs.mkdirSync(parent);
+    const file = path.join(parent, 'file');
+    for (let iteration = 0; iteration < 16; ++iteration) {
+      fs.writeFileSync(file, 'original');
+      let messages = [];
+      const initial = engine.watchDirectory(
+        parent,
+        {recursive: false},
+        (message) => messages.push(message),
+      );
+      await initial.ready;
+      fs.unlinkSync(file);
+      await until(
+        () =>
+          messages.some((message) =>
+            message.events?.some(
+              (event) => event.path === file && event.action === 'deleted',
+            ),
+          ),
+        `iteration ${iteration} deletion`,
+      );
+      const guard = observe(engine, parent);
+      await guard.handle.ready;
+      initial.dispose();
+      await initial.closed;
+      fs.writeFileSync(file, 'recreated');
+      await until(
+        () => guard.messages.some((message) => message.type === 'guard'),
+        `iteration ${iteration} recreation guard`,
+      );
+      messages = [];
+      const restored = engine.watchDirectory(
+        parent,
+        {recursive: false},
+        (message) => messages.push(message),
+      );
+      await restored.ready;
+      guard.handle.dispose();
+      await guard.handle.closed;
+      fs.writeFileSync(file, `later external write ${iteration}`);
+      await until(
+        () =>
+          messages.some((message) =>
+            message.events?.some(
+              (event) => event.path === file && event.action === 'updated',
+            ),
+          ),
+        `iteration ${iteration} restored content`,
+      );
+      restored.dispose();
+      await restored.closed;
+    }
+  },
+);

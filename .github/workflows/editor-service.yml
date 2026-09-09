@@ -1,0 +1,36 @@
+name: Editor service replay
+on:
+  workflow_dispatch:
+    inputs:
+      editor_ref:
+        description: Full immutable editor commit SHA
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  replay:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          path: watcher
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - name: Require an immutable editor revision
+        env:
+          EDITOR_REF: ${{ inputs.editor_ref }}
+        run: node -e "if (!/^[0-9a-f]{40}$/.test(process.env.EDITOR_REF)) throw new Error('Use a full immutable commit SHA');"
+      - uses: actions/checkout@v6
+        with:
+          repository: lumine-code/lumine
+          ref: ${{ inputs.editor_ref }}
+          path: lumine
+          sparse-checkout: src
+      - run: npm ci
+        working-directory: watcher
+      - name: Replay persistent worker and delayed renderer acknowledgements
+        run: node scripts/replay-editor-service.js --editor ../lumine
+        working-directory: watcher
