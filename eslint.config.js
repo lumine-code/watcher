@@ -1,7 +1,7 @@
 const js = require('@eslint/js');
 const globals = require('globals');
 module.exports = [
-  {ignores: ['build/**', 'node_modules/**']},
+  {ignores: ['build/**', 'node_modules/**', '.electron-runtime/**']},
   js.configs.recommended,
   {
     languageOptions: {sourceType: 'commonjs', globals: globals.node},

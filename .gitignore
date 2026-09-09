@@ -2,6 +2,7 @@
 build/
 prebuilds/
 node_modules/
+.electron-runtime/
 token.txt
 .DS_Store
 .idea

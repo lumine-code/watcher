@@ -10,6 +10,10 @@ permissions:
   contents: read
 jobs:
   replay:
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [inline, node-child, electron-child]
     runs-on: macos-latest
     timeout-minutes: 15
     steps:
@@ -31,6 +35,26 @@ jobs:
           sparse-checkout: src
       - run: npm ci
         working-directory: watcher
-      - name: Replay persistent worker and delayed renderer acknowledgements
+      - name: Replay inline worker with controlled close timing
+        if: matrix.mode == 'inline'
         run: node scripts/replay-editor-service.js --editor ../lumine
+        working-directory: watcher
+      - name: Replay the real Node child bootstrap and IPC queue
+        if: matrix.mode == 'node-child'
+        env:
+          LUMINE_FILE_WATCH_TRACE: '1'
+        run: node scripts/replay-editor-service.js --editor ../lumine --real-child
+        working-directory: watcher
+      - name: Install the selected editor's exact Electron runtime
+        if: matrix.mode == 'electron-child'
+        run: |
+          node -e "const version = require('../lumine/package.json').devDependencies.electron; if (!/^\d+\.\d+\.\d+$/.test(version)) throw new Error('Expected an exact Electron version'); require('node:child_process').execFileSync('npm', ['install', '--prefix', '.electron-runtime', '--no-package-lock', '--no-save', 'electron@' + version], {stdio: 'inherit'});"
+        working-directory: watcher
+      - name: Replay the real child bootstrap in Electron Node mode
+        if: matrix.mode == 'electron-child'
+        env:
+          LUMINE_FILE_WATCH_TRACE: '1'
+          ELECTRON_RUN_AS_NODE: '1'
+        run: |
+          node -e "const electron = require('./.electron-runtime/node_modules/electron'); const result = require('node:child_process').spawnSync(electron, ['scripts/replay-editor-service.js', '--editor', '../lumine', '--real-child'], {stdio: 'inherit', env: process.env}); if (result.error) throw result.error; process.exit(result.status ?? 1);"
         working-directory: watcher

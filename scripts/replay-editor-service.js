@@ -3,8 +3,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const {EventEmitter} = require('node:events');
-const {execFileSync} = require('node:child_process');
-const {createEngine} = require('..');
+const {execFileSync, fork} = require('node:child_process');
 
 function option(name, fallback) {
   const at = process.argv.indexOf(name);
@@ -20,6 +19,9 @@ const FileWatchService = require(
 const FileWatchClient = require(path.join(editorRoot, 'src/file-watch-client'));
 const {VERSION} = require(path.join(editorRoot, 'src/file-watch-protocol'));
 const iterations = Number(option('--iterations', 8));
+if (!Number.isSafeInteger(iterations) || iterations < 1)
+  throw new Error('iterations must be positive');
+const realChild = process.argv.includes('--real-child');
 const platform = option('--platform', process.platform);
 const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const trace = [];
@@ -43,7 +45,7 @@ class NativeChild extends EventEmitter {
     super();
     this.generation = generation;
     this.connected = true;
-    const native = createEngine();
+    const native = require('..').createEngine();
     let nextSource = 0;
     this.runtime = new FileWatchWorker({
       platform,
@@ -154,6 +156,8 @@ async function main() {
       editor: sourceSha,
       nativePlatform: process.platform,
       policyPlatform: platform,
+      realChild,
+      electron: process.versions.electron,
       iterations,
     }),
   );
@@ -161,8 +165,40 @@ async function main() {
     path.join(os.tmpdir(), 'editor-watch-replay-'),
   );
   const root = fs.realpathSync.native(unresolvedRoot);
+  const moduleRoot = path.join(root, '.native-modules');
+  if (realChild) {
+    fs.mkdirSync(path.join(moduleRoot, '@lumine-code'), {recursive: true});
+    fs.symlinkSync(
+      path.resolve(__dirname, '..'),
+      path.join(moduleRoot, '@lumine-code', 'watcher'),
+      process.platform === 'win32' ? 'junction' : 'dir',
+    );
+  }
   const service = new FileWatchService({
-    spawnWorker: ({generation}) => new NativeChild(generation),
+    spawnWorker: ({generation}) => {
+      if (!realChild) return new NativeChild(generation);
+      const child = fork(
+        path.join(editorRoot, 'src/file-watch-worker-bootstrap'),
+        [],
+        {
+          env: {
+            ...process.env,
+            NODE_PATH: moduleRoot,
+            ELECTRON_RUN_AS_NODE: '1',
+            ELECTRON_NO_ATTACH_CONSOLE: '1',
+            LUMINE_FILE_WATCH_GENERATION: String(generation),
+          },
+          execArgv: [],
+          silent: true,
+          windowsHide: true,
+        },
+      );
+      child.on('message', (message) => record({bootstrap: message}));
+      child.stderr.on('data', (data) =>
+        record({bootstrapStderr: data.toString()}),
+      );
+      return child;
+    },
   });
   const application = service.createClient('application');
   let client;
@@ -205,7 +241,7 @@ async function main() {
         fs.writeFileSync(file, 'created');
       };
       fs.mkdirSync(path.dirname(file), {recursive: true});
-      if (platform !== 'darwin') fs.writeFileSync(file, 'created');
+      if (realChild || platform !== 'darwin') fs.writeFileSync(file, 'created');
       await until(
         () => events.some((event) => event.action === 'created'),
         `iteration ${iteration} missing-parent creation`,
@@ -248,7 +284,11 @@ async function main() {
       JSON.stringify(
         {
           error: error.stack,
-          diagnostics: children.map((child) => child.runtime.diagnostics()),
+          diagnostics: realChild
+            ? await service
+                .requestWorker('diagnostics')
+                .catch((error) => ({error: error.message}))
+            : children.map((child) => child.runtime.diagnostics()),
           trace,
         },
         null,
