@@ -13,6 +13,7 @@ class MacOS : public Platform {
     std::string path;
     int fd = -1;
     uintptr_t token = 0;
+    uint32_t mask = 0;
     dev_t device = 0;
     ino_t inode = 0;
     std::map<Id, bool> owners;
@@ -173,9 +174,12 @@ private:
   void configureGuardNode(const std::shared_ptr<GuardNode>& node) {
     uint32_t mask = NOTE_DELETE | NOTE_RENAME | NOTE_REVOKE;
     for (const auto& owner : node->owners) if (owner.second) { mask |= NOTE_WRITE | NOTE_LINK; break; }
+    if ((node->mask & mask) == mask) return;
+    mask |= node->mask;
     struct kevent change;
     EV_SET(&change, node->fd, EVFILT_VNODE, EV_ADD | EV_CLEAR, mask, 0, reinterpret_cast<void*>(node->token));
     if (kevent(guardQueue, &change, 1, nullptr, 0, nullptr) < 0) throw fs::filesystem_error("Cannot arm directory guard", fs::u8path(node->path), std::error_code(errno, std::generic_category()));
+    node->mask = mask;
   }
 
   void addGuard(Subscription& sub) {
@@ -218,9 +222,8 @@ private:
   void releaseGuardNode(const std::shared_ptr<GuardNode>& node, Id id) {
     node->owners.erase(id);
     if (!node->owners.empty()) {
-      // Removing membership interest only narrows the mask. If that update
-      // fails, the remaining root guards are still armed with the old mask.
-      try { configureGuardNode(node); } catch (const std::exception&) {}
+      // Keep existing registration intact for other owners. Any membership
+      // hints left in its mask are ignored when no remaining owner needs them.
       return;
     }
     struct kevent change;

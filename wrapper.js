@@ -73,9 +73,12 @@ exports.createWrapper = (NativeEngine) => ({
             Object.assign(new Error(message.error.message), message.error),
           );
         const {id: _id, ...event} = message;
-        handle.callback(
-          handle.guard && event.type === 'changes' ? {type: 'guard'} : event,
-        );
+        if (handle.guard && event.type === 'changes') {
+          // The Windows/Linux fallback remains shallow, but a directory's
+          // timestamp notification is not a change to its membership.
+          if (event.events.some((change) => change.action !== 'updated'))
+            handle.callback({type: 'guard'});
+        } else handle.callback(event);
       }
     });
     return {
