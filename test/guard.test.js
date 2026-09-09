@@ -195,17 +195,7 @@ for (const keepUnrelatedGuard of [false, true]) {
     `macOS guard delivery survives thousands of stream lifecycles with ${keepUnrelatedGuard ? 'a persistent unrelated guard' : 'empty guard intervals'}`,
     {skip: process.platform !== 'darwin', timeout: 120000},
     async (t) => {
-      const previousDiagnostics = process.env.LUMINE_GUARD_DIAGNOSTICS;
-      process.env.LUMINE_GUARD_DIAGNOSTICS = '1';
-      let state;
-      try {
-        state = fixture(t);
-      } finally {
-        if (previousDiagnostics === undefined)
-          delete process.env.LUMINE_GUARD_DIAGNOSTICS;
-        else process.env.LUMINE_GUARD_DIAGNOSTICS = previousDiagnostics;
-      }
-      const {root, engine} = state;
+      const {root, engine} = fixture(t);
       const profile = path.join(root, 'profile');
       const working = path.join(root, 'working');
       fs.mkdirSync(profile);
@@ -216,10 +206,8 @@ for (const keepUnrelatedGuard of [false, true]) {
         () => {},
       );
       await persistent.ready;
-      if (keepUnrelatedGuard) {
-        const unrelated = observe(engine, profile);
-        await unrelated.handle.ready;
-      }
+      const unrelated = keepUnrelatedGuard ? observe(engine, profile) : null;
+      if (unrelated) await unrelated.handle.ready;
       for (let iteration = 0; iteration < 4096; ++iteration) {
         const stream = engine.watchDirectory(
           working,
@@ -248,6 +236,13 @@ for (const keepUnrelatedGuard of [false, true]) {
         assert.deepEqual(previous.messages, []);
         replacement.handle.dispose();
         await replacement.handle.closed;
+      }
+      if (unrelated) {
+        fs.mkdirSync(path.join(profile, 'still-observed'));
+        await until(
+          () => unrelated.messages.some((message) => message.type === 'guard'),
+          'persistent unrelated guard after stream churn',
+        );
       }
     },
   );
