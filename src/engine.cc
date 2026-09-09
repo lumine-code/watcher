@@ -75,9 +75,9 @@ void Engine::emit(Message message) {
     // Once a source is invalid, more activity adds no information until JS has
     // consumed the invalidation and started reconciliation. This also bounds a
     // sustained stream of kernel-overflow notifications while JS is stalled.
-    if (message.type == "changes" || message.type == "invalidate") {
+    if (message.type == "changes" || message.type == "invalidate" || message.type == "guard") {
       if (std::any_of(messages.begin(), messages.end(), [&](const Message& pending) {
-        return pending.id == message.id && pending.type == "invalidate";
+        return pending.id == message.id && (pending.type == "invalidate" || (message.type == "guard" && pending.type == "guard"));
       })) return;
     }
     if (message.type == "changes" && queuedEvents + message.events.size() > MAX_QUEUED_EVENTS) {
@@ -154,8 +154,8 @@ private:
   bool released = false;
   static void cleanup(void* data) { auto self = static_cast<NativeEngine*>(data); self->cleaned = true; self->engine->shutdown(); }
   void watch(const Napi::CallbackInfo& info) {
-    if (info.Length() != 3 || !info[0].IsNumber() || !info[1].IsString() || !info[2].IsBoolean()) throw Napi::TypeError::New(info.Env(), "Expected an id, path and recursive flag");
-    engine->enqueue({Command::Watch, {static_cast<Id>(info[0].As<Napi::Number>().Int64Value()), info[1].As<Napi::String>().Utf8Value(), info[2].As<Napi::Boolean>().Value()}});
+    if (info.Length() != 4 || !info[0].IsNumber() || !info[1].IsString() || !info[2].IsBoolean() || !info[3].IsBoolean()) throw Napi::TypeError::New(info.Env(), "Expected an id, path, recursive flag and guard flag");
+    engine->enqueue({Command::Watch, {static_cast<Id>(info[0].As<Napi::Number>().Int64Value()), info[1].As<Napi::String>().Utf8Value(), info[2].As<Napi::Boolean>().Value(), info[3].As<Napi::Boolean>().Value()}});
   }
   void unwatch(const Napi::CallbackInfo& info) {
     if (info.Length() != 1 || !info[0].IsNumber()) throw Napi::TypeError::New(info.Env(), "Expected an id");

@@ -48,6 +48,8 @@ The callback receives `{type: 'changes', events: [{action, path}]}`, with action
 
 The native delivery queue holds at most 8192 change events and one thread-safe-function wakeup. Overflow replaces lost events with invalidations while preserving lifecycle messages. Directory loss is reported explicitly. Windows does not report a watched directory's own rename; the editor service uses parent and ancestor guards to maintain fixed lexical locations. FSEvents uses its root-change capability. No automatic external file following, snapshot history, Watchman selection, or polling fallback is provided.
 
+The editor service can request `{recursive: false, guard: true}` for directory membership and location guards. On macOS these use shared vnode descriptors inside the same native backend, with unnamed `{type: 'guard'}` notifications and root-change invalidation. They do not start FSEvents streams or subscribe to descendant contents, including when guarding `/`. Ancestor vnode descriptors detect relocation while remaining shared between guards. Windows and Linux accept this option through their shallow sources; the editor uses it only on macOS. Normal shallow FSEvents sources seed immediate entry metadata after arming so delayed creation flags and access-time-only changes do not masquerade as fresh content writes.
+
 ## Building
 
 Run `npm ci`, `npm test`, and `npm run lint`. The CI matrix builds and tests Node.js 24 on Windows, macOS and Linux. `npm run benchmark` reports readiness, close latency, idle CPU, memory and event latency on a synthetic tree. `node scripts/stress-windows.js --iterations 20` exercises teardown while notifications are in flight.

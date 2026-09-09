@@ -2,21 +2,38 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/event.h>
 #include <unordered_map>
 #include "engine.hh"
 #include <set>
 
 namespace lumine {
 class MacOS : public Platform {
+  struct GuardNode {
+    std::string path;
+    int fd = -1;
+    uintptr_t token = 0;
+    dev_t device = 0;
+    ino_t inode = 0;
+    std::map<Id, bool> owners;
+    ~GuardNode() { if (fd >= 0) close(fd); }
+  };
   struct Subscription {
     MacOS* owner;
     Source source;
     fs::path canonical;
     std::unordered_map<std::string, struct stat> seen;
     FSEventStreamRef stream = nullptr;
+    std::vector<std::shared_ptr<GuardNode>> guardNodes;
   };
   CFRunLoopRef loop;
   CFRunLoopSourceRef wakeSource;
+  int guardQueue = -1;
+  CFFileDescriptorRef guardDescriptor = nullptr;
+  CFRunLoopSourceRef guardRunSource = nullptr;
+  uintptr_t nextGuardToken = 0;
+  std::map<std::string, std::shared_ptr<GuardNode>> guardPaths;
+  std::map<int, std::shared_ptr<GuardNode>> guardFds;
   std::map<Id, std::unique_ptr<Subscription>> sources;
   std::set<Id> pendingClose;
 public:
@@ -27,12 +44,21 @@ public:
     wakeSource = CFRunLoopSourceCreate(nullptr, 0, &context);
     CFRunLoopAddSource(loop, wakeSource, kCFRunLoopDefaultMode);
   }
-  ~MacOS() override { CFRunLoopSourceInvalidate(wakeSource); CFRelease(wakeSource); CFRelease(loop); }
+  ~MacOS() override {
+    clearGuardQueue();
+    CFRunLoopSourceInvalidate(wakeSource); CFRelease(wakeSource); CFRelease(loop);
+  }
   void add(const Source& source) override {
     auto canonical = fs::canonical(fs::u8path(source.path));
     if (!fs::is_directory(canonical)) throw fs::filesystem_error("Expected a directory", canonical, std::make_error_code(std::errc::not_a_directory));
     auto sub = std::make_unique<Subscription>();
     sub->owner = this; sub->source = source; sub->canonical = canonical;
+    if (source.guard) {
+      sources.emplace(source.id, std::move(sub));
+      addGuard(*sources.at(source.id));
+      engine.ready(source.id);
+      return;
+    }
     auto root = CFStringCreateWithCString(nullptr, utf8(canonical).c_str(), kCFStringEncodingUTF8);
     const void* values[]{root};
     auto paths = CFArrayCreate(nullptr, values, 1, &kCFTypeArrayCallBacks);
@@ -53,6 +79,19 @@ public:
       throw std::runtime_error("Cannot start FSEvents stream");
     }
     sources.emplace(source.id, std::move(sub));
+    if (!source.recursive) {
+      auto& state = *sources.at(source.id);
+      // Shallow sources back fixed files. Seed immediate metadata while the
+      // stream is armed so delayed pre-subscription ItemModified flags can be
+      // distinguished from a later write restoring the same size and mtime.
+      // Recursive project streams never crawl their tree for this metadata.
+      for (const auto& entry : fs::directory_iterator(canonical)) {
+        struct stat status{};
+        if (lstat(entry.path().c_str(), &status) == 0) {
+          state.seen.emplace(utf8(fs::u8path(source.path) / entry.path().filename()), status);
+        } else if (errno != ENOENT) throw fs::filesystem_error("Cannot inspect initial directory entry", entry.path(), std::error_code(errno, std::generic_category()));
+      }
+    }
     engine.ready(source.id);
   }
   void remove(Id id) override {
@@ -61,9 +100,12 @@ public:
       // Source storage outlives its stream. Stop, unschedule and invalidate on
       // the runloop owner before releasing the raw callback context.
       auto stream = found->second->stream;
-      FSEventStreamStop(stream);
-      FSEventStreamUnscheduleFromRunLoop(stream, loop, kCFRunLoopDefaultMode);
-      FSEventStreamInvalidate(stream); FSEventStreamRelease(stream);
+      if (stream) {
+        FSEventStreamStop(stream);
+        FSEventStreamUnscheduleFromRunLoop(stream, loop, kCFRunLoopDefaultMode);
+        FSEventStreamInvalidate(stream); FSEventStreamRelease(stream);
+      }
+      for (const auto& node : found->second->guardNodes) releaseGuardNode(node, id);
       sources.erase(found);
     }
     pendingClose.erase(id);
@@ -83,6 +125,140 @@ public:
     CFRunLoopWakeUp(loop);
   }
 private:
+  void clearGuardQueue() {
+    if (guardRunSource) {
+      CFRunLoopRemoveSource(loop, guardRunSource, kCFRunLoopDefaultMode);
+      CFRelease(guardRunSource);
+      guardRunSource = nullptr;
+    }
+    if (guardDescriptor) {
+      CFFileDescriptorInvalidate(guardDescriptor);
+      CFRelease(guardDescriptor);
+      guardDescriptor = nullptr;
+    }
+    if (guardQueue >= 0) { close(guardQueue); guardQueue = -1; }
+  }
+
+  void ensureGuardQueue() {
+    if (guardQueue >= 0) return;
+    guardQueue = kqueue();
+    if (guardQueue < 0) throw std::system_error(errno, std::generic_category(), "Cannot open vnode guard queue");
+    if (fcntl(guardQueue, F_SETFD, FD_CLOEXEC) < 0) {
+      int error = errno;
+      clearGuardQueue();
+      throw std::system_error(error, std::generic_category(), "Cannot configure vnode guard queue");
+    }
+    CFFileDescriptorContext context{0, this, nullptr, nullptr, nullptr};
+    guardDescriptor = CFFileDescriptorCreate(nullptr, guardQueue, false, [](CFFileDescriptorRef descriptor, CFOptionFlags, void* context) {
+      auto self = static_cast<MacOS*>(context);
+      try { self->drainGuards(); }
+      catch (const std::exception& error) {
+        for (const auto& pair : self->sources) {
+          if (!pair.second->source.guard) continue;
+          self->engine.error(pair.second->source, error.what(), "ERR_WATCH_GUARD");
+          self->pendingClose.insert(pair.first);
+        }
+      }
+      // CFFileDescriptor disables callbacks when firing; re-enable after the
+      // bounded nonblocking kevent drain, always on the engine's owner thread.
+      CFFileDescriptorEnableCallBacks(descriptor, kCFFileDescriptorReadCallBack);
+    }, &context);
+    if (!guardDescriptor) { clearGuardQueue(); throw std::bad_alloc(); }
+    guardRunSource = CFFileDescriptorCreateRunLoopSource(nullptr, guardDescriptor, 0);
+    if (!guardRunSource) { clearGuardQueue(); throw std::bad_alloc(); }
+    CFRunLoopAddSource(loop, guardRunSource, kCFRunLoopDefaultMode);
+    CFFileDescriptorEnableCallBacks(guardDescriptor, kCFFileDescriptorReadCallBack);
+  }
+
+  void configureGuardNode(const std::shared_ptr<GuardNode>& node) {
+    uint32_t mask = NOTE_DELETE | NOTE_RENAME | NOTE_REVOKE;
+    for (const auto& owner : node->owners) if (owner.second) { mask |= NOTE_WRITE | NOTE_LINK; break; }
+    struct kevent change;
+    EV_SET(&change, node->fd, EVFILT_VNODE, EV_ADD | EV_CLEAR, mask, 0, reinterpret_cast<void*>(node->token));
+    if (kevent(guardQueue, &change, 1, nullptr, 0, nullptr) < 0) throw fs::filesystem_error("Cannot arm directory guard", fs::u8path(node->path), std::error_code(errno, std::generic_category()));
+  }
+
+  void addGuard(Subscription& sub) {
+    ensureGuardQueue();
+    // NOTE_WRITE on a directory is immediate membership activity, not writes
+    // to descendant contents. Ancestors only need relocation/unmount signals;
+    // shared vnode descriptors keep a guard for '/' cheap and non-recursive.
+    std::vector<fs::path> paths;
+    auto current = sub.canonical;
+    while (true) {
+      paths.push_back(current);
+      auto parent = current.parent_path();
+      if (parent == current) break;
+      current = parent;
+    }
+    for (auto it = paths.rbegin(); it != paths.rend(); ++it) {
+      auto key = utf8(*it);
+      struct stat status{};
+      if (stat(it->c_str(), &status) < 0) throw fs::filesystem_error("Cannot inspect guard directory", *it, std::error_code(errno, std::generic_category()));
+      std::shared_ptr<GuardNode> node;
+      auto found = guardPaths.find(key);
+      if (found != guardPaths.end() && found->second->device == status.st_dev && found->second->inode == status.st_ino) node = found->second;
+      if (!node) {
+        node = std::make_shared<GuardNode>();
+        node->path = key;
+        node->fd = open(it->c_str(), O_EVTONLY | O_DIRECTORY | O_CLOEXEC);
+        if (node->fd < 0) throw fs::filesystem_error("Cannot open guard directory", *it, std::error_code(errno, std::generic_category()));
+        if (fstat(node->fd, &status) < 0) throw fs::filesystem_error("Cannot inspect guard descriptor", *it, std::error_code(errno, std::generic_category()));
+        node->device = status.st_dev; node->inode = status.st_ino;
+        node->token = ++nextGuardToken;
+        guardPaths[key] = node;
+        guardFds[node->fd] = node;
+      }
+      sub.guardNodes.push_back(node);
+      node->owners[sub.source.id] = *it == sub.canonical;
+      configureGuardNode(node);
+    }
+  }
+
+  void releaseGuardNode(const std::shared_ptr<GuardNode>& node, Id id) {
+    node->owners.erase(id);
+    if (!node->owners.empty()) {
+      // Removing membership interest only narrows the mask. If that update
+      // fails, the remaining root guards are still armed with the old mask.
+      try { configureGuardNode(node); } catch (const std::exception&) {}
+      return;
+    }
+    struct kevent change;
+    EV_SET(&change, node->fd, EVFILT_VNODE, EV_DELETE, 0, 0, nullptr);
+    kevent(guardQueue, &change, 1, nullptr, 0, nullptr);
+    guardFds.erase(node->fd);
+    auto found = guardPaths.find(node->path);
+    if (found != guardPaths.end() && found->second == node) guardPaths.erase(found);
+    // Closing the last fd removes any queued vnode event. Event tokens also
+    // reject stale deliveries if the OS later reuses the descriptor number.
+    close(node->fd);
+    node->fd = -1;
+  }
+
+  void drainGuards() {
+    struct kevent events[64];
+    const struct timespec immediate{};
+    for (unsigned batch = 0; batch < 16; ++batch) {
+      int count = kevent(guardQueue, nullptr, 0, events, 64, &immediate);
+      if (count < 0) { if (errno == EINTR) continue; throw std::system_error(errno, std::generic_category(), "Cannot read vnode guard queue"); }
+      if (!count) return;
+      for (int i = 0; i < count; ++i) {
+        auto found = guardFds.find(static_cast<int>(events[i].ident));
+        if (found == guardFds.end() || reinterpret_cast<uintptr_t>(events[i].udata) != found->second->token) continue;
+        auto node = found->second;
+        for (const auto& owner : node->owners) {
+          if (events[i].flags & EV_ERROR) {
+            engine.error(sources.at(owner.first)->source, std::system_category().message(static_cast<int>(events[i].data)), "ERR_WATCH_GUARD");
+            pendingClose.insert(owner.first);
+          } else if (events[i].fflags & (NOTE_DELETE | NOTE_RENAME | NOTE_REVOKE)) {
+            engine.invalidate(owner.first, "root-changed");
+            pendingClose.insert(owner.first);
+          } else if (owner.second && (events[i].fflags & (NOTE_WRITE | NOTE_LINK))) engine.emit({"guard", owner.first});
+        }
+      }
+    }
+  }
+
   void process(Subscription& sub, size_t count, char** paths, const FSEventStreamEventFlags flags[]) {
     std::vector<Event> events;
     for (size_t i = 0; i < count; ++i) {
@@ -121,16 +297,18 @@ private:
       else if (removed) action = "deleted";
       struct stat current{};
       bool inspected = lstat(path.c_str(), &current) == 0;
-      bool contentChanged = flags[i] & kFSEventStreamEventFlagItemModified;
+      bool contentChanged = action == "updated" && (flags[i] & kFSEventStreamEventFlagItemModified);
       auto previous = sub.seen.find(lexical);
       if (contentChanged && inspected && previous != sub.seen.end()) {
         const auto& old = previous->second;
         bool sameContentStamp = current.st_dev == old.st_dev && current.st_ino == old.st_ino && current.st_size == old.st_size && current.st_mtimespec.tv_sec == old.st_mtimespec.tv_sec && current.st_mtimespec.tv_nsec == old.st_mtimespec.tv_nsec;
         bool permissionsChanged = current.st_mode != old.st_mode || current.st_uid != old.st_uid || current.st_gid != old.st_gid;
+        bool accessTimeChanged = current.st_atimespec.tv_sec != old.st_atimespec.tv_sec || current.st_atimespec.tv_nsec != old.st_atimespec.tv_nsec;
+        bool statusTimeChanged = current.st_ctimespec.tv_sec != old.st_ctimespec.tv_sec || current.st_ctimespec.tv_nsec != old.st_ctimespec.tv_nsec;
         // ItemModified, like ItemCreated, may remain set on a later chmod.
         // A metadata-only transition does not force a content reread. Writes
         // restoring size/mtime still force rereads when permissions are stable.
-        if (sameContentStamp && permissionsChanged) contentChanged = false;
+        if (sameContentStamp && (!statusTimeChanged || permissionsChanged || accessTimeChanged)) contentChanged = false;
       }
       // FSEvents can retain ItemCreated on a later write notification. Keep
       // only live entry metadata needed to disambiguate subsequent activity.

@@ -383,6 +383,50 @@ test('case-only renames report the old and new spelling', async (t) => {
   );
 });
 
+test('last-access reads on a pooled parent do not become content updates', async (t) => {
+  const {root, engine} = fixture(t);
+  const watch = observe(engine, root);
+  await watch.handle.ready;
+  const file = path.join(root, 'access-only');
+  const old = new Date(Date.now() - 60000);
+  fs.writeFileSync(file, 'seeded');
+  fs.utimesSync(file, old, old);
+  await until(() => watch.any(file), 'seeded pooled entry');
+  await delay(100);
+  watch.messages.length = 0;
+  fs.readFileSync(file);
+  await delay(200);
+  assert.equal(
+    watch.messages.some((message) =>
+      message.events?.some(
+        (event) => event.path === file && event.contentChanged,
+      ),
+    ),
+    false,
+  );
+});
+
+test('existing files rewritten with restored size and mtime retain a content hint', async (t) => {
+  const {root, engine} = fixture(t);
+  const file = path.join(root, 'same-stamp');
+  const old = new Date(Date.now() - 60000);
+  fs.writeFileSync(file, 'before');
+  fs.utimesSync(file, old, old);
+  const watch = observe(engine, root);
+  await watch.handle.ready;
+  fs.writeFileSync(file, 'after!');
+  fs.utimesSync(file, old, old);
+  await until(
+    () =>
+      watch.messages.some((message) =>
+        message.events?.some(
+          (event) => event.path === file && event.contentChanged,
+        ),
+      ),
+    'same-stamp rewrite',
+  );
+});
+
 test(
   'a stalled JS consumer gets bounded-queue invalidation and watching continues',
   {timeout: 30000},

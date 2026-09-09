@@ -13,6 +13,7 @@ declare namespace Watcher {
   }
   type Message =
     | {type: 'changes'; events: Event[]}
+    | {type: 'guard'}
     | {type: 'invalidate'; reason: string}
     | {type: 'error'; error: WatchError};
   interface DirectoryWatch {
@@ -23,7 +24,7 @@ declare namespace Watcher {
   interface Engine {
     watchDirectory(
       path: string,
-      options: {recursive?: boolean},
+      options: {recursive?: boolean; guard?: boolean},
       callback: (message: Message) => void,
     ): DirectoryWatch;
     close(): Promise<void>;

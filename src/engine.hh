@@ -22,7 +22,7 @@ struct Message {
   std::vector<Event> events;
   std::string reason, message, code, path;
 };
-struct Source { Id id; std::string path; bool recursive; };
+struct Source { Id id; std::string path; bool recursive; bool guard = false; };
 struct Command { enum Type { Watch, Unwatch, Close } type; Source source; };
 class Engine;
 class Platform {

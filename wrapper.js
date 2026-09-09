@@ -73,7 +73,9 @@ exports.createWrapper = (NativeEngine) => ({
             Object.assign(new Error(message.error.message), message.error),
           );
         const {id: _id, ...event} = message;
-        handle.callback(event);
+        handle.callback(
+          handle.guard && event.type === 'changes' ? {type: 'guard'} : event,
+        );
       }
     });
     return {
@@ -95,6 +97,10 @@ exports.createWrapper = (NativeEngine) => ({
           typeof options.recursive !== 'boolean'
         )
           throw new TypeError('Expected recursive to be a boolean');
+        if (options.guard !== undefined && typeof options.guard !== 'boolean')
+          throw new TypeError('Expected guard to be a boolean');
+        if (options.guard && options.recursive)
+          throw new TypeError('A directory guard cannot be recursive');
         if (typeof callback !== 'function')
           throw new TypeError('Expected a directory watch callback');
         const id = ++nextId;
@@ -102,10 +108,16 @@ exports.createWrapper = (NativeEngine) => ({
           ready: deferred(),
           closed: deferred(),
           callback,
+          guard: options.guard ?? false,
           disposed: false,
         };
         handles.set(id, handle);
-        native.watch(id, path.resolve(directory), options.recursive ?? false);
+        native.watch(
+          id,
+          path.resolve(directory),
+          options.recursive ?? false,
+          options.guard ?? false,
+        );
         return {
           ready: handle.ready.promise,
           closed: handle.closed.promise,
