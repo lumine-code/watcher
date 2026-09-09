@@ -1,45 +1,31 @@
-declare type FilePath = string;
-declare type GlobPattern = string;
-
-declare namespace ParcelWatcher {
-  export type BackendType =
-    'fs-events' | 'watchman' | 'inotify' | 'windows' | 'brute-force';
-  export type EventType = 'create' | 'update' | 'delete';
-  export interface Options {
-    ignore?: (FilePath | GlobPattern | RegExp)[];
-    backend?: BackendType;
+declare namespace Watcher {
+  interface Event {
+    action: 'created' | 'updated' | 'deleted';
+    path: string;
   }
-  export type SubscribeCallback = (
-    err: Error | null,
-    events: Event[],
-  ) => unknown;
-  export interface AsyncSubscription {
-    unsubscribe(): Promise<void>;
+  interface WatchError {
+    message: string;
+    code: string;
+    path: string;
+    backend: 'windows' | 'inotify' | 'fs-events';
   }
-  export interface Event {
-    path: FilePath;
-    type: EventType;
+  type Message =
+    | {type: 'changes'; events: Event[]}
+    | {type: 'invalidate'; reason: string}
+    | {type: 'error'; error: WatchError};
+  interface DirectoryWatch {
+    readonly ready: Promise<void>;
+    readonly closed: Promise<void>;
+    dispose(): void;
   }
-  export function getEventsSince(
-    dir: FilePath,
-    snapshot: FilePath,
-    opts?: Options,
-  ): Promise<Event[]>;
-  export function subscribe(
-    dir: FilePath,
-    fn: SubscribeCallback,
-    opts?: Options,
-  ): Promise<AsyncSubscription>;
-  export function unsubscribe(
-    dir: FilePath,
-    fn: SubscribeCallback,
-    opts?: Options,
-  ): Promise<void>;
-  export function writeSnapshot(
-    dir: FilePath,
-    snapshot: FilePath,
-    opts?: Options,
-  ): Promise<FilePath>;
+  interface Engine {
+    watchDirectory(
+      path: string,
+      options: {recursive?: boolean},
+      callback: (message: Message) => void,
+    ): DirectoryWatch;
+    close(): Promise<void>;
+  }
+  function createEngine(): Engine;
 }
-
-export = ParcelWatcher;
+export = Watcher;
