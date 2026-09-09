@@ -190,6 +190,52 @@ test(
   },
 );
 
+test(
+  'macOS guard delivery survives thousands of stream and empty-guard lifecycles',
+  {skip: process.platform !== 'darwin', timeout: 120000},
+  async (t) => {
+    const {root, engine} = fixture(t);
+    const profile = path.join(root, 'profile');
+    const working = path.join(root, 'working');
+    fs.mkdirSync(profile);
+    fs.mkdirSync(working);
+    const persistent = engine.watchDirectory(
+      profile,
+      {recursive: true},
+      () => {},
+    );
+    await persistent.ready;
+    for (let iteration = 0; iteration < 4096; ++iteration) {
+      const stream = engine.watchDirectory(
+        working,
+        {recursive: iteration % 2 === 0},
+        () => {},
+      );
+      await stream.ready;
+      stream.dispose();
+      await stream.closed;
+      if (iteration < 511 || iteration % 64 !== 63) continue;
+      const previous = observe(engine, working);
+      await previous.handle.ready;
+      const child = path.join(working, `entry-${iteration}`);
+      // Dispose with a vnode hint pending, then reuse the now unowned path.
+      // The replacement's later mutation must still reach its own callback.
+      fs.mkdirSync(child);
+      previous.handle.dispose();
+      const replacement = observe(engine, working);
+      await Promise.all([previous.handle.closed, replacement.handle.ready]);
+      fs.rmdirSync(child);
+      await until(
+        () => replacement.messages.some((message) => message.type === 'guard'),
+        `guard delivery after stream lifecycle ${iteration + 1}`,
+      );
+      assert.deepEqual(previous.messages, []);
+      replacement.handle.dispose();
+      await replacement.handle.closed;
+    }
+  },
+);
+
 test('guards reject recursive or non-boolean guard options', async (t) => {
   const {root, engine} = fixture(t);
   assert.throws(
