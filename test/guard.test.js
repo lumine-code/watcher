@@ -194,7 +194,17 @@ test(
   'macOS guard delivery survives thousands of stream and empty-guard lifecycles',
   {skip: process.platform !== 'darwin', timeout: 120000},
   async (t) => {
-    const {root, engine} = fixture(t);
+    const previousDiagnostics = process.env.LUMINE_GUARD_DIAGNOSTICS;
+    process.env.LUMINE_GUARD_DIAGNOSTICS = '1';
+    let state;
+    try {
+      state = fixture(t);
+    } finally {
+      if (previousDiagnostics === undefined)
+        delete process.env.LUMINE_GUARD_DIAGNOSTICS;
+      else process.env.LUMINE_GUARD_DIAGNOSTICS = previousDiagnostics;
+    }
+    const {root, engine} = state;
     const profile = path.join(root, 'profile');
     const working = path.join(root, 'working');
     fs.mkdirSync(profile);

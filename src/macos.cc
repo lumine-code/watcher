@@ -4,6 +4,8 @@
 #include <sys/stat.h>
 #include <sys/event.h>
 #include <unordered_map>
+#include <cstdio>
+#include <cstdlib>
 #include "engine.hh"
 #include <set>
 
@@ -37,6 +39,9 @@ class MacOS : public Platform {
   std::map<int, std::shared_ptr<GuardNode>> guardFds;
   std::map<Id, std::unique_ptr<Subscription>> sources;
   std::set<Id> pendingClose;
+  const bool guardDiagnostics = std::getenv("LUMINE_GUARD_DIAGNOSTICS") != nullptr;
+  size_t streamAdds = 0, guardAdds = 0, guardCallbacks = 0, guardEvents = 0;
+  size_t lastGuardCallbackStream = 0;
 public:
   explicit MacOS(Engine& engine) : Platform(engine), loop(CFRunLoopGetCurrent()) {
     CFRetain(loop);
@@ -55,11 +60,13 @@ public:
     auto sub = std::make_unique<Subscription>();
     sub->owner = this; sub->source = source; sub->canonical = canonical;
     if (source.guard) {
+      ++guardAdds;
       sources.emplace(source.id, std::move(sub));
       addGuard(*sources.at(source.id));
       engine.ready(source.id);
       return;
     }
+    ++streamAdds;
     auto root = CFStringCreateWithCString(nullptr, utf8(canonical).c_str(), kCFStringEncodingUTF8);
     const void* values[]{root};
     auto paths = CFArrayCreate(nullptr, values, 1, &kCFTypeArrayCallBacks);
@@ -112,7 +119,21 @@ public:
     pendingClose.erase(id);
     engine.closed(id);
   }
-  void removeAll() override { while (!sources.empty()) remove(sources.begin()->first); }
+  void removeAll() override {
+    if (guardDiagnostics && guardQueue >= 0) {
+      std::fprintf(stderr, "GUARD_DIAGNOSTICS queue=%d valid=%d streams=%zu guards=%zu callbacks=%zu events=%zu lastCallbackStream=%zu liveFds=%zu liveSources=%zu\n", guardQueue, guardDescriptor ? CFFileDescriptorIsValid(guardDescriptor) : 0, streamAdds, guardAdds, guardCallbacks, guardEvents, lastGuardCallbackStream, guardFds.size(), sources.size());
+      struct kevent events[64];
+      const struct timespec immediate{};
+      int count = kevent(guardQueue, nullptr, 0, events, 64, &immediate);
+      std::fprintf(stderr, "GUARD_DIAGNOSTICS pending=%d errno=%d\n", count, errno);
+      for (int i = 0; i < count; ++i) {
+        auto found = guardFds.find(static_cast<int>(events[i].ident));
+        bool live = found != guardFds.end() && reinterpret_cast<uintptr_t>(events[i].udata) == found->second->token;
+        std::fprintf(stderr, "GUARD_DIAGNOSTICS fd=%zu filter=%d flags=%u fflags=%u token=%zu live=%d\n", events[i].ident, events[i].filter, events[i].flags, events[i].fflags, reinterpret_cast<uintptr_t>(events[i].udata), live);
+      }
+    }
+    while (!sources.empty()) remove(sources.begin()->first);
+  }
   bool empty() const override { return sources.empty(); }
   void pump() override {
     // The wake source keeps an otherwise empty runloop asleep until a command
@@ -152,6 +173,8 @@ private:
     CFFileDescriptorContext context{0, this, nullptr, nullptr, nullptr};
     guardDescriptor = CFFileDescriptorCreate(nullptr, guardQueue, false, [](CFFileDescriptorRef descriptor, CFOptionFlags, void* context) {
       auto self = static_cast<MacOS*>(context);
+      ++self->guardCallbacks;
+      self->lastGuardCallbackStream = self->streamAdds;
       try { self->drainGuards(); }
       catch (const std::exception& error) {
         for (const auto& pair : self->sources) {
@@ -245,6 +268,7 @@ private:
       int count = kevent(guardQueue, nullptr, 0, events, 64, &immediate);
       if (count < 0) { if (errno == EINTR) continue; throw std::system_error(errno, std::generic_category(), "Cannot read vnode guard queue"); }
       if (!count) return;
+      guardEvents += count;
       for (int i = 0; i < count; ++i) {
         auto found = guardFds.find(static_cast<int>(events[i].ident));
         if (found == guardFds.end() || reinterpret_cast<uintptr_t>(events[i].udata) != found->second->token) continue;
