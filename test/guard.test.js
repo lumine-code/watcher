@@ -158,6 +158,38 @@ test(
   },
 );
 
+test(
+  'macOS guards deliver when their queue is created above descriptor 2048',
+  {skip: process.platform !== 'darwin', timeout: 20000},
+  async (t) => {
+    const {root, engine} = fixture(t);
+    const descriptors = [];
+    const releaseDescriptors = () => {
+      for (const descriptor of descriptors.splice(0)) fs.closeSync(descriptor);
+    };
+    t.after(releaseDescriptors);
+    // The guard queue is lazy. Force its first descriptor above select's usual
+    // fd_set range without relying on asynchronous FSEvents teardown timing.
+    while ((descriptors.at(-1) ?? -1) < 2048)
+      descriptors.push(fs.openSync('/dev/null', 'r'));
+    const {handle, messages} = observe(engine, root);
+    await handle.ready;
+    const child = path.join(root, 'entry');
+    fs.mkdirSync(child);
+    await until(
+      () => messages.some((message) => message.type === 'guard'),
+      'membership with a high-numbered guard queue',
+    );
+    releaseDescriptors();
+    messages.length = 0;
+    fs.rmdirSync(child);
+    await until(
+      () => messages.some((message) => message.type === 'guard'),
+      'high-numbered guard queue after unrelated descriptors close',
+    );
+  },
+);
+
 test('guards reject recursive or non-boolean guard options', async (t) => {
   const {root, engine} = fixture(t);
   assert.throws(
