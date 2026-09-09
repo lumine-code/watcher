@@ -6,7 +6,8 @@ namespace lumine {
 constexpr size_t MAX_QUEUED_EVENTS = 8192;
 Engine::Engine(Napi::Env env, Napi::Function fn) {
   callback = Napi::ThreadSafeFunction::New(env, fn, "Lumine filesystem engine", 1, 1);
-  thread = std::thread([this] { run(); });
+  try { thread = std::thread([this] { run(); }); }
+  catch (...) { callback.Release(); throw; }
   std::unique_lock<std::mutex> lock(startupMutex);
   startupCondition.wait(lock, [this] { return started; });
   if (!startupError.empty()) { thread.join(); throw std::runtime_error(startupError); }
@@ -64,6 +65,14 @@ void Engine::emit(Message message) {
   bool schedule = false;
   {
     std::lock_guard<std::mutex> lock(messagesMutex);
+    // Once a source is invalid, more activity adds no information until JS has
+    // consumed the invalidation and started reconciliation. This also bounds a
+    // sustained stream of kernel-overflow notifications while JS is stalled.
+    if (message.type == "changes" || message.type == "invalidate") {
+      if (std::any_of(messages.begin(), messages.end(), [&](const Message& pending) {
+        return pending.id == message.id && pending.type == "invalidate";
+      })) return;
+    }
     if (message.type == "changes" && queuedEvents + message.events.size() > MAX_QUEUED_EVENTS) {
       // Lifecycle messages survive overflow; every lost batch invalidates its source.
       std::map<Id, bool> lost;
@@ -104,7 +113,8 @@ void Engine::deliver(Napi::Env env, Napi::Function fn) {
       error.Set("message", message.message); error.Set("code", message.code);
       error.Set("path", message.path); error.Set("backend", backendName()); object.Set("error", error);
     }
-    fn.Call({object});
+    try { fn.Call({object}); }
+    catch (const Napi::Error& error) { napi_fatal_exception(env, error.Value()); }
     if (env.IsExceptionPending()) { auto error = env.GetAndClearPendingException(); napi_fatal_exception(env, error.Value()); }
   }
 }
@@ -121,7 +131,12 @@ public:
   }
   explicit NativeEngine(const Napi::CallbackInfo& info) : Napi::ObjectWrap<NativeEngine>(info) {
     if (info.Length() != 1 || !info[0].IsFunction()) throw Napi::TypeError::New(info.Env(), "Expected a callback");
-    engine = std::make_unique<Engine>(info.Env(), info[0].As<Napi::Function>());
+    try { engine = std::make_unique<Engine>(info.Env(), info[0].As<Napi::Function>()); }
+    catch (const std::exception& failure) {
+      auto error = Napi::Error::New(info.Env(), failure.what());
+      error.Value().Set("code", "ERR_WATCH_ENGINE");
+      throw error;
+    }
     napi_add_env_cleanup_hook(info.Env(), cleanup, this);
     Ref();
   }

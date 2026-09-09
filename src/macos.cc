@@ -1,4 +1,7 @@
 #include <CoreServices/CoreServices.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <unordered_set>
 #include "engine.hh"
 #include <set>
 
@@ -8,6 +11,7 @@ class MacOS : public Platform {
     MacOS* owner;
     Source source;
     fs::path canonical;
+    std::unordered_set<std::string> seen;
     FSEventStreamRef stream = nullptr;
   };
   CFRunLoopRef loop;
@@ -100,9 +104,27 @@ private:
       if ((created && removed) || renamed) {
         std::error_code error;
         auto status = fs::symlink_status(path, error);
-        action = !fs::exists(status) ? "deleted" : created || renamed ? "created" : "updated";
-      } else if (created) action = "created";
+        bool exists = fs::exists(status);
+        // On case-insensitive volumes the old spelling still resolves after a
+        // case-only rename. F_GETPATH returns the actual spelling of the entry.
+        if (exists && renamed) {
+          int fd = open(path.c_str(), O_EVTONLY | O_SYMLINK);
+          if (fd >= 0) {
+            char actual[PATH_MAX];
+            if (fcntl(fd, F_GETPATH, actual) == 0) exists = path == fs::path(actual);
+            close(fd);
+          }
+        }
+        action = !exists ? "deleted" : sub.seen.count(lexical) ? "updated" : "created";
+      } else if (created) action = sub.seen.count(lexical) ? "updated" : "created";
       else if (removed) action = "deleted";
+      // FSEvents can retain ItemCreated on a later write notification. Keep
+      // only the live names needed to distinguish those subsequent updates.
+      if (action == "deleted") {
+        for (auto it = sub.seen.begin(); it != sub.seen.end();) {
+          if (within(*it, lexical)) it = sub.seen.erase(it); else ++it;
+        }
+      } else sub.seen.insert(lexical);
       events.push_back({action, lexical, (flags[i] & kFSEventStreamEventFlagItemModified) != 0});
     }
     engine.changes(sub.source.id, std::move(events));

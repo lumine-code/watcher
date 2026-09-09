@@ -2,6 +2,8 @@ declare namespace Watcher {
   interface Event {
     action: 'created' | 'updated' | 'deleted';
     path: string;
+    /** Native content activity; forces a reread even if metadata is unchanged. */
+    contentChanged?: true;
   }
   interface WatchError {
     message: string;

@@ -56,7 +56,10 @@ private:
     std::vector<Event> discovered;
     while (!pending.empty()) {
       auto path = pending.back(); pending.pop_back();
-      int wd = inotify_add_watch(descriptor, path.c_str(), MASK);
+      // An explicit root may resolve through a symlink. Traversed descendants
+      // must remain directories even if replaced by a symlink during startup.
+      auto mask = MASK | (path == fs::u8path(sub.source.path) ? 0 : IN_DONT_FOLLOW);
+      int wd = inotify_add_watch(descriptor, path.c_str(), mask);
       if (wd < 0) {
         if (path != root && (errno == ENOENT || errno == ENOTDIR)) continue;
         throw fs::filesystem_error("Cannot watch directory", path, std::error_code(errno, std::generic_category()));

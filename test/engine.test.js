@@ -292,6 +292,77 @@ test('rejects malformed API inputs without allocating sources', async (t) => {
   assert.throws(() => engine.watchDirectory(root, {}, null), TypeError);
 });
 
+test('content hints distinguish writes from reads and chmod', async (t) => {
+  const {root, engine} = fixture(t);
+  const watch = observe(engine, root);
+  await watch.handle.ready;
+  const file = path.join(root, 'content');
+  fs.writeFileSync(file, 'old');
+  await until(() => watch.any(file), 'initial content');
+  fs.appendFileSync(file, 'new');
+  await until(
+    () =>
+      watch.messages.some((message) =>
+        message.events?.some(
+          (event) => event.path === file && event.contentChanged,
+        ),
+      ),
+    'native content hint',
+  );
+  await delay(100);
+  watch.messages.length = 0;
+  fs.readFileSync(file);
+  fs.chmodSync(file, 0o400);
+  try {
+    await delay(150);
+    assert.equal(
+      watch.messages.some((message) =>
+        message.events?.some((event) => event.contentChanged),
+      ),
+      false,
+    );
+  } finally {
+    fs.chmodSync(file, 0o600);
+  }
+});
+
+test('recursive traversal does not follow directory symlinks outside its root', async (t) => {
+  const {root, engine} = fixture(t);
+  const watched = path.join(root, 'watched'),
+    outside = path.join(root, 'outside');
+  fs.mkdirSync(watched);
+  fs.mkdirSync(outside);
+  fs.symlinkSync(
+    outside,
+    path.join(watched, 'linked'),
+    process.platform === 'win32' ? 'junction' : 'dir',
+  );
+  const watch = observe(engine, watched, true);
+  await watch.handle.ready;
+  fs.writeFileSync(path.join(outside, 'external'), 'x');
+  await delay(150);
+  assert.equal(
+    watch.messages.some((message) =>
+      message.events?.some((event) => event.path.endsWith('external')),
+    ),
+    false,
+  );
+});
+
+test('case-only renames report the old and new spelling', async (t) => {
+  const {root, engine} = fixture(t);
+  const oldPath = path.join(root, 'case-name'),
+    newPath = path.join(root, 'CASE-NAME');
+  fs.writeFileSync(oldPath, 'x');
+  const watch = observe(engine, root);
+  await watch.handle.ready;
+  fs.renameSync(oldPath, newPath);
+  await until(
+    () => watch.has('deleted', oldPath) && watch.has('created', newPath),
+    'case-only rename pair',
+  );
+});
+
 test(
   'a stalled JS consumer gets bounded-queue invalidation and watching continues',
   {timeout: 30000},
