@@ -14,8 +14,11 @@ Engine::Engine(Napi::Env env, Napi::Function fn) {
 }
 Engine::~Engine() { shutdown(); }
 void Engine::enqueue(Command command) {
+  // Wakeup handles are owned by the platform. Keep the final platform release
+  // mutually exclusive with a producer queuing work and waking its thread.
+  std::lock_guard<std::mutex> lock(commandsMutex);
   if (finished.load()) return;
-  { std::lock_guard<std::mutex> lock(commandsMutex); commands.push_back(std::move(command)); }
+  commands.push_back(std::move(command));
   platform->wake();
 }
 void Engine::shutdown() {
@@ -57,7 +60,11 @@ void Engine::run() {
     platform->removeAll();
     while (!platform->empty()) platform->pump();
   }
-  finished = true;
+  {
+    std::lock_guard<std::mutex> lock(commandsMutex);
+    finished = true;
+    platform.reset();
+  }
   emit({"engineClosed"});
   callback.Release();
 }

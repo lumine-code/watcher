@@ -221,6 +221,26 @@ test('engine close drains active and starting sources and rejects further work',
   assert.throws(() => observe(engine, root), {code: 'ERR_ENGINE_CLOSED'});
 });
 
+test(
+  'closed engines release Linux control descriptors even while their JS objects are retained',
+  {skip: process.platform !== 'linux'},
+  async () => {
+    const count = () => fs.readdirSync('/proc/self/fd').length;
+    const before = count();
+    const retained = [];
+    for (let i = 0; i < 50; ++i) {
+      const engine = createEngine();
+      retained.push(engine);
+      await engine.close();
+    }
+    assert.ok(
+      count() <= before + 2,
+      `Descriptors increased from ${before} to ${count()}`,
+    );
+    assert.equal(retained.length, 50);
+  },
+);
+
 test('deleted native roots explicitly invalidate instead of remaining apparently active', async (t) => {
   const {root, engine} = fixture(t);
   const directory = path.join(root, 'watched');
