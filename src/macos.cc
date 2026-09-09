@@ -115,6 +115,9 @@ public:
       }
       for (const auto& node : found->second->guardNodes) releaseGuardNode(node, id);
       sources.erase(found);
+      // The CF descriptor is one-shot. Retire its notification state along
+      // with the last vnode registration before this queue is reused.
+      if (guardFds.empty()) clearGuardQueue();
     }
     pendingClose.erase(id);
     engine.closed(id);
