@@ -1,7 +1,7 @@
 {
   "name": "@lumine-code/watcher",
   "author": "lumine-code",
-  "version": "2.6.1",
+  "version": "1.0.0",
   "main": "index.js",
   "types": "index.d.ts",
   "repository": "https://github.com/lumine-code/watcher",
