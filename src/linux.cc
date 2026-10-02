@@ -95,9 +95,12 @@ private:
   }
   void drain() {
     alignas(inotify_event) char buffer[64 * 1024];
-    while (true) {
-      ssize_t size = read(descriptor, buffer, sizeof(buffer));
-      if (size < 0) { if (errno == EAGAIN) return; if (errno == EINTR) continue; throw std::system_error(errno, std::generic_category(), "Cannot read inotify"); }
+    // A continuously busy descriptor must yield to close/unwatch commands.
+    // Read at most 1 MiB per pump; remaining events keep the fd readable.
+    for (unsigned batch = 0; batch < 16; ++batch) {
+      ssize_t size;
+      do { size = read(descriptor, buffer, sizeof(buffer)); } while (size < 0 && errno == EINTR);
+      if (size < 0) { if (errno == EAGAIN) return; throw std::system_error(errno, std::generic_category(), "Cannot read inotify"); }
       if (!size) return;
       for (ssize_t offset = 0; offset < size;) {
         auto event = reinterpret_cast<inotify_event*>(buffer + offset);

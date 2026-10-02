@@ -1,5 +1,4 @@
 #include "engine.hh"
-#include <algorithm>
 #include <stdexcept>
 
 namespace lumine {
@@ -75,11 +74,8 @@ void Engine::emit(Message message) {
     // Once a source is invalid, more activity adds no information until JS has
     // consumed the invalidation and started reconciliation. This also bounds a
     // sustained stream of kernel-overflow notifications while JS is stalled.
-    if (message.type == "changes" || message.type == "invalidate" || message.type == "guard") {
-      if (std::any_of(messages.begin(), messages.end(), [&](const Message& pending) {
-        return pending.id == message.id && (pending.type == "invalidate" || (message.type == "guard" && pending.type == "guard"));
-      })) return;
-    }
+    if ((message.type == "changes" || message.type == "invalidate" || message.type == "guard") && queuedInvalidations.count(message.id)) return;
+    if (message.type == "guard" && queuedGuards.count(message.id)) return;
     if (message.type == "changes" && queuedEvents + message.events.size() > MAX_QUEUED_EVENTS) {
       // Lifecycle messages survive overflow; every lost batch invalidates its source.
       std::map<Id, bool> lost;
@@ -90,17 +86,20 @@ void Engine::emit(Message message) {
       }
       queuedEvents = 0;
       for (const auto& item : lost) {
-        bool present = std::any_of(messages.begin(), messages.end(), [&](const Message& pending) { return pending.id == item.first && pending.type == "invalidate"; });
-        if (!present) messages.push_back({"invalidate", item.first, {}, "queue-overflow"});
+        if (queuedInvalidations.insert(item.first).second) messages.push_back({"invalidate", item.first, {}, "queue-overflow"});
       }
-    } else { queuedEvents += message.events.size(); messages.push_back(std::move(message)); }
+    } else {
+      if (message.type == "invalidate") queuedInvalidations.insert(message.id);
+      else if (message.type == "guard") queuedGuards.insert(message.id);
+      queuedEvents += message.events.size(); messages.push_back(std::move(message));
+    }
     if (!scheduled) { scheduled = true; schedule = true; }
   }
   if (schedule) callback.NonBlockingCall([this](Napi::Env env, Napi::Function fn) { if (env) deliver(env, fn); });
 }
 void Engine::deliver(Napi::Env env, Napi::Function fn) {
   std::deque<Message> batch;
-  { std::lock_guard<std::mutex> lock(messagesMutex); batch.swap(messages); queuedEvents = 0; scheduled = false; }
+  { std::lock_guard<std::mutex> lock(messagesMutex); batch.swap(messages); queuedInvalidations.clear(); queuedGuards.clear(); queuedEvents = 0; scheduled = false; }
   for (const auto& message : batch) {
     auto object = Napi::Object::New(env);
     object.Set("type", message.type);

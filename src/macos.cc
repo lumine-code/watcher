@@ -318,20 +318,22 @@ private:
       if (contentChanged && inspected && previous != sub.seen.end()) {
         const auto& old = previous->second;
         bool sameContentStamp = current.st_dev == old.st_dev && current.st_ino == old.st_ino && current.st_size == old.st_size && current.st_mtimespec.tv_sec == old.st_mtimespec.tv_sec && current.st_mtimespec.tv_nsec == old.st_mtimespec.tv_nsec;
-        bool permissionsChanged = current.st_mode != old.st_mode || current.st_uid != old.st_uid || current.st_gid != old.st_gid;
-        bool accessTimeChanged = current.st_atimespec.tv_sec != old.st_atimespec.tv_sec || current.st_atimespec.tv_nsec != old.st_atimespec.tv_nsec;
         bool statusTimeChanged = current.st_ctimespec.tv_sec != old.st_ctimespec.tv_sec || current.st_ctimespec.tv_nsec != old.st_ctimespec.tv_nsec;
-        // ItemModified, like ItemCreated, may remain set on a later chmod.
-        // A metadata-only transition does not force a content reread. Writes
-        // restoring size/mtime still force rereads when permissions are stable.
-        if (sameContentStamp && (!statusTimeChanged || permissionsChanged || accessTimeChanged)) contentChanged = false;
+        // A read can change atime while leaving a retained ItemModified flag.
+        // Stable content metadata and ctime suppress that read-only hint. A
+        // changed ctime remains ambiguous: writes restoring size/mtime can be
+        // coalesced with chmod or atime changes, so preserve their content hint.
+        if (sameContentStamp && !statusTimeChanged) contentChanged = false;
       }
       // FSEvents can retain ItemCreated on a later write notification. Keep
       // only live entry metadata needed to disambiguate subsequent activity.
       if (action == "deleted") {
-        for (auto it = sub.seen.begin(); it != sub.seen.end();) {
-          if (within(it->first, lexical)) it = sub.seen.erase(it); else ++it;
-        }
+        bool directory = (flags[i] & kFSEventStreamEventFlagItemIsDir) || (previous != sub.seen.end() && S_ISDIR(previous->second.st_mode));
+        if (directory) {
+          for (auto it = sub.seen.begin(); it != sub.seen.end();) {
+            if (within(it->first, lexical)) it = sub.seen.erase(it); else ++it;
+          }
+        } else sub.seen.erase(lexical);
       } else if (inspected) sub.seen.insert_or_assign(lexical, current);
       events.push_back({action, lexical, contentChanged});
     }

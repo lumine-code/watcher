@@ -10,6 +10,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 namespace lumine {
@@ -66,6 +67,7 @@ private:
   std::string startupError;
   std::mutex messagesMutex;
   std::deque<Message> messages;
+  std::unordered_set<Id> queuedInvalidations, queuedGuards;
   size_t queuedEvents = 0;
   bool scheduled = false;
   std::atomic<bool> stopping{false}, finished{false};

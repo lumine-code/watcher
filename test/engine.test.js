@@ -152,6 +152,54 @@ test('recursive sources remove moved-out coverage and attach internal renamed de
   );
 });
 
+test('mass deletion of nested files preserves directory cleanup and later recreations', async (t) => {
+  const {root, engine} = fixture(t);
+  const watched = path.join(root, 'watched');
+  fs.mkdirSync(watched);
+  const watch = observe(engine, watched, true);
+  await watch.handle.ready;
+  const tree = path.join(watched, 'tree');
+  const files = [];
+  for (let directory = 0; directory < 8; ++directory) {
+    const nested = path.join(tree, String(directory), 'nested');
+    fs.mkdirSync(nested, {recursive: true});
+    for (let index = 0; index < 32; ++index) {
+      const file = path.join(nested, String(index));
+      fs.writeFileSync(file, 'before');
+      files.push(file);
+    }
+  }
+  const survivor = path.join(watched, 'survivor');
+  fs.writeFileSync(survivor, 'before');
+  await until(
+    () => files.every((file) => watch.has('created', file)),
+    'populated nested tree',
+  );
+  watch.messages.length = 0;
+  for (const file of files) fs.unlinkSync(file);
+  await until(
+    () => files.every((file) => watch.has('deleted', file)),
+    'each nested file deletion',
+  );
+  watch.messages.length = 0;
+  for (const file of files) fs.writeFileSync(file, 'before');
+  await until(
+    () => files.every((file) => watch.has('created', file)),
+    'nested files recreated before directory relocation',
+  );
+  // Moving out a populated directory need not enumerate child deletions.
+  // Its directory event must discard cached descendants at their old names.
+  fs.renameSync(tree, path.join(root, 'moved-out'));
+  await until(() => watch.has('deleted', tree), 'nested directory deletion');
+  watch.messages.length = 0;
+  const recreated = files[0];
+  fs.mkdirSync(path.dirname(recreated), {recursive: true});
+  fs.writeFileSync(recreated, 'after!');
+  await until(() => watch.has('created', recreated), 'fresh recreated entry');
+  fs.writeFileSync(survivor, 'after!');
+  await until(() => watch.has('updated', survivor), 'unrelated file survives');
+});
+
 test('identical native directory sources remain independent', async (t) => {
   const {root, engine} = fixture(t);
   const first = observe(engine, root),
@@ -241,6 +289,68 @@ test(
   },
 );
 
+test(
+  'Linux closes its engine while independent producers continue flooding events',
+  {skip: process.platform !== 'linux', timeout: 20000},
+  async (t) => {
+    const root = fs.mkdtempSync(
+      path.join(fs.realpathSync(os.tmpdir()), 'lumine-watch-flood-'),
+    );
+    const engine = createEngine();
+    const producers = [];
+    t.after(async () => {
+      await Promise.all(producers.map((producer) => producer.terminate()));
+      await engine.close();
+      fs.rmSync(root, {recursive: true, force: true});
+    });
+    const handle = engine.watchDirectory(root, {recursive: false}, () => {});
+    await handle.ready;
+    const readiness = [];
+    for (let index = 0; index < 2; ++index) {
+      const producer = new Worker(
+        `const fs = require('node:fs');
+         const path = require('node:path');
+         const {parentPort, workerData} = require('node:worker_threads');
+         const descriptors = Array.from({length: 64}, (_, file) =>
+           fs.openSync(path.join(workerData.root, workerData.index + '-' + file), 'w'));
+         const content = Buffer.from('x');
+         parentPort.postMessage('ready');
+         while (true) {
+           for (const descriptor of descriptors)
+             fs.writeSync(descriptor, content, 0, 1, 0);
+         }`,
+        {eval: true, workerData: {root, index}},
+      );
+      producers.push(producer);
+      readiness.push(
+        new Promise((resolve, reject) => {
+          producer.once('message', resolve);
+          producer.once('error', reject);
+        }),
+      );
+    }
+    await Promise.all(readiness);
+    await delay(10);
+    let timeout;
+    try {
+      await Promise.race([
+        engine.close(),
+        new Promise((_, reject) => {
+          timeout = setTimeout(
+            () =>
+              reject(new Error('Engine close starved behind event producers')),
+            5000,
+          );
+        }),
+      ]);
+      await handle.closed;
+      assert.ok(producers.every((producer) => producer.threadId !== -1));
+    } finally {
+      clearTimeout(timeout);
+    }
+  },
+);
+
 test('deleted native roots explicitly invalidate instead of remaining apparently active', async (t) => {
   const {root, engine} = fixture(t);
   const directory = path.join(root, 'watched');
@@ -312,7 +422,7 @@ test('rejects malformed API inputs without allocating sources', async (t) => {
   assert.throws(() => engine.watchDirectory(root, {}, null), TypeError);
 });
 
-test('content hints distinguish writes from reads and chmod', async (t) => {
+test('content hints distinguish writes from reads and preserve ambiguous chmod activity', async (t) => {
   const {root, engine} = fixture(t);
   const watch = observe(engine, root);
   await watch.handle.ready;
@@ -332,15 +442,32 @@ test('content hints distinguish writes from reads and chmod', async (t) => {
   await delay(100);
   watch.messages.length = 0;
   fs.readFileSync(file);
+  await delay(150);
+  assert.equal(
+    watch.messages.some((message) =>
+      message.events?.some((event) => event.contentChanged),
+    ),
+    false,
+  );
   fs.chmodSync(file, 0o400);
   try {
     await delay(150);
-    assert.equal(
-      watch.messages.some((message) =>
-        message.events?.some((event) => event.contentChanged),
-      ),
-      false,
-    );
+    // FSEvents may retain ItemModified on chmod. Changed ctime cannot prove
+    // that no same-stamp write was coalesced with that permissions change.
+    if (process.platform !== 'darwin') {
+      assert.equal(
+        watch.messages.some((message) =>
+          message.events?.some((event) => event.contentChanged),
+        ),
+        false,
+      );
+    } else {
+      await until(
+        () => watch.has('updated', file),
+        'permissions activity on the watched file',
+      );
+    }
+    assert.equal(fs.readFileSync(file, 'utf8'), 'oldnew');
   } finally {
     fs.chmodSync(file, 0o600);
   }
@@ -427,34 +554,98 @@ test('existing files rewritten with restored size and mtime retain a content hin
   );
 });
 
+test('same-stamp writes retain a content hint when access time also changes', async (t) => {
+  const {root, engine} = fixture(t);
+  const file = path.join(root, 'same-stamp-access');
+  const old = new Date(Date.now() - 60000);
+  fs.writeFileSync(file, 'before');
+  fs.utimesSync(file, old, old);
+  const watch = observe(engine, root);
+  await watch.handle.ready;
+  await delay(50);
+  fs.writeFileSync(file, 'after!');
+  fs.utimesSync(file, new Date(), old);
+  await until(
+    () =>
+      watch.messages.some((message) =>
+        message.events?.some(
+          (event) => event.path === file && event.contentChanged,
+        ),
+      ),
+    'same-stamp rewrite with changed access time',
+  );
+});
+
+test(
+  'macOS preserves same-stamp writes coalesced with permissions changes',
+  {skip: process.platform !== 'darwin'},
+  async (t) => {
+    const {root, engine} = fixture(t);
+    const file = path.join(root, 'same-stamp-permissions');
+    const old = new Date(Date.now() - 60000);
+    fs.writeFileSync(file, 'before');
+    fs.chmodSync(file, 0o600);
+    fs.utimesSync(file, old, old);
+    const watch = observe(engine, root);
+    await watch.handle.ready;
+    await delay(50);
+    fs.writeFileSync(file, 'after!');
+    fs.utimesSync(file, old, old);
+    fs.chmodSync(file, 0o400);
+    try {
+      await until(
+        () =>
+          watch.messages.some((message) =>
+            message.events?.some(
+              (event) => event.path === file && event.contentChanged,
+            ),
+          ),
+        'same-stamp rewrite with changed permissions',
+      );
+    } finally {
+      fs.chmodSync(file, 0o600);
+    }
+  },
+);
+
 test(
   'a stalled JS consumer gets bounded-queue invalidation and watching continues',
   {timeout: 30000},
   async (t) => {
     const {root, engine} = fixture(t);
-    const watch = observe(engine, root);
-    await watch.handle.ready;
+    const watches = [observe(engine, root), observe(engine, root)];
+    await Promise.all(watches.map((watch) => watch.handle.ready));
     // Both create and write notifications accumulate while JS cannot drain the
     // native queue. macOS may coalesce writes; exceed the cap with distinct paths.
     for (let i = 0; i < 10000; ++i)
       fs.writeFileSync(path.join(root, `burst-${i}`), 'x');
-    await until(
-      () => watch.messages.some((message) => message.type === 'invalidate'),
-      'queue overflow invalidation',
-    );
-    if (process.platform === 'linux') {
-      // An inotify kernel overflow invalidates and closes all sources sharing its
-      // fd. A JS-queue overflow keeps the source armed; both are explicit.
-      const nativeLoss = watch.messages.some(
-        (message) => message.reason === 'native-overflow',
+    // Lifecycle acknowledgements survive replacement of queued changes with
+    // invalidations, including a source armed while those messages are pending.
+    const starting = observe(engine, root);
+    await starting.handle.ready;
+    starting.handle.dispose();
+    await starting.handle.closed;
+    for (const watch of watches) {
+      await until(
+        () => watch.messages.some((message) => message.type === 'invalidate'),
+        'queue overflow invalidation for each independent source',
       );
-      if (nativeLoss) {
-        await watch.handle.closed;
-        return;
+      if (process.platform === 'linux') {
+        // An inotify kernel overflow invalidates and closes all sources sharing
+        // its fd. A JS-queue overflow keeps each source armed; both are explicit.
+        const nativeLoss = watch.messages.some(
+          (message) => message.reason === 'native-overflow',
+        );
+        if (nativeLoss) {
+          await watch.handle.closed;
+          continue;
+        }
       }
+      const file = path.join(root, `after-overflow-${watches.indexOf(watch)}`);
+      fs.writeFileSync(file, 'x');
+      await until(() => watch.any(file), 'continued delivery after overflow');
+      watch.handle.dispose();
+      await watch.handle.closed;
     }
-    const file = path.join(root, 'after-overflow');
-    fs.writeFileSync(file, 'x');
-    await until(() => watch.any(file), 'continued delivery after overflow');
   },
 );
