@@ -2,6 +2,8 @@
 
 Observes directory changes through native filesystem backends.
 
+Fork of [parcel-bundler/watcher](https://github.com/parcel-bundler/watcher).
+
 A Node-API library maintained by lumine-code, derived from the Parcel watcher project. It provides the native directory sources used by the editor's filesystem observation service.
 
 ## Features
