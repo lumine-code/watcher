@@ -17,7 +17,8 @@
     "README.md",
     "LICENSE",
     "src",
-    "binding.gyp"
+    "binding.gyp",
+    "THIRD_PARTY_NOTICES"
   ],
   "scripts": {
     "build": "node-gyp rebuild",
