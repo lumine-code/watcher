@@ -477,23 +477,28 @@ test('recursive traversal does not follow directory symlinks outside its root', 
   const {root, engine} = fixture(t);
   const watched = path.join(root, 'watched'),
     outside = path.join(root, 'outside');
+  const link = path.join(watched, 'linked');
   fs.mkdirSync(watched);
   fs.mkdirSync(outside);
   fs.symlinkSync(
     outside,
-    path.join(watched, 'linked'),
+    link,
     process.platform === 'win32' ? 'junction' : 'dir',
   );
-  const watch = observe(engine, watched, true);
-  await watch.handle.ready;
-  fs.writeFileSync(path.join(outside, 'external'), 'x');
-  await delay(150);
-  assert.equal(
-    watch.messages.some((message) =>
-      message.events?.some((event) => event.path.endsWith('external')),
-    ),
-    false,
-  );
+  try {
+    const watch = observe(engine, watched, true);
+    await watch.handle.ready;
+    fs.writeFileSync(path.join(outside, 'external'), 'x');
+    await delay(150);
+    assert.equal(
+      watch.messages.some((message) =>
+        message.events?.some((event) => event.path.endsWith('external')),
+      ),
+      false,
+    );
+  } finally {
+    fs.unlinkSync(link);
+  }
 });
 
 test('case-only renames report the old and new spelling', async (t) => {
